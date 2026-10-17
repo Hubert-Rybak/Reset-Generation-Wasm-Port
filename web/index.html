@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Reset Generation</title>
+<style>
+  :root { --bg:#0a0a12; --fg:#e8e8f0; --accent:#ffb000; --panel:#16161f; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    overflow:hidden; touch-action:none; }
+  #stage { position:fixed; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:12px; padding:12px; }
+  canvas#screen { image-rendering: pixelated; image-rendering: crisp-edges;
+    background:#000; border-radius:6px; box-shadow:0 8px 40px rgba(0,0,0,.6);
+    touch-action:none; }
+  #loader { position:fixed; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:18px; background:var(--bg);
+    text-align:center; padding:24px; z-index:10; }
+  #loader h1 { margin:0; font-size:clamp(22px,6vw,40px); letter-spacing:2px;
+    color:var(--accent); text-transform:uppercase; }
+  #loader p { margin:0; opacity:.7; font-size:14px; max-width:30em; line-height:1.5; }
+  #bar { width:min(440px,80vw); height:12px; background:var(--panel);
+    border-radius:8px; overflow:hidden; }
+  #bar > div { height:100%; width:0; background:linear-gradient(90deg,#ffb000,#ff5a00);
+    transition:width .2s; }
+  #status { font-size:13px; opacity:.6; min-height:1.2em; }
+  #start { padding:14px 34px; font-size:18px; font-weight:700; cursor:pointer;
+    border:none; border-radius:10px; color:#111; background:var(--accent); }
+  #start:disabled { opacity:.4; cursor:default; }
+  /* touch controls */
+  #touch { display:none; position:fixed; inset:0; pointer-events:none; z-index:5; }
+  #touch.on { display:block; }
+  .pad { position:absolute; pointer-events:auto; user-select:none;
+    background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.18);
+    border-radius:14px; display:flex; align-items:center; justify-content:center;
+    font-size:22px; color:#fff; font-weight:700; }
+  .pad:active { background:rgba(255,176,0,.35); }
+  #dpad { left:14px; bottom:18px; width:168px; height:168px; }
+  #dpad .pad { position:absolute; width:54px; height:54px; }
+  #up{left:57px;top:0}#down{left:57px;bottom:0}#left{left:0;top:57px}#right{right:0;top:57px}
+  #mid{left:57px;top:57px;border-radius:50%;opacity:.5}
+  #btns { right:18px; bottom:30px; width:150px; height:150px; }
+  #btns .pad { position:absolute; width:70px; height:70px; border-radius:50%; font-size:14px; }
+  #bSel{right:0;bottom:46px;background:rgba(80,200,80,.18)}
+  #bBack{left:0;top:30px;background:rgba(220,80,80,.18)}
+  #hint { position:fixed; top:8px; left:0; right:0; text-align:center; font-size:12px;
+    opacity:.45; z-index:5; pointer-events:none; }
+  #gear { position:fixed; top:10px; right:12px; z-index:6; cursor:pointer; opacity:.5;
+    font-size:20px; background:none; border:none; color:#fff; }
+</style>
+</head>
+<body>
+<div id="loader">
+  <h1>Reset Generation</h1>
+  <p>N-Gage WebAssembly port. The original game (© RedLynx / Nokia) is recompiled
+     from its native code to run in your browser. Assets (~36&nbsp;MB) load once and
+     are cached.</p>
+  <div id="bar"><div></div></div>
+  <div id="status">Preparing…</div>
+  <button id="start" disabled>Loading…</button>
+</div>
+
+<div id="stage">
+  <canvas id="screen" width="240" height="320"></canvas>
+</div>
+<div id="hint">Arrows = move · Ctrl = select · Shift = back · click twice for in-game help</div>
+<button id="gear" title="Toggle touch controls">⚙</button>
+
+<div id="touch">
+  <div id="dpad" class="padgroup">
+    <div class="pad" id="up"  data-k="38">▲</div>
+    <div class="pad" id="down" data-k="40">▼</div>
+    <div class="pad" id="left" data-k="37">◀</div>
+    <div class="pad" id="right" data-k="39">▶</div>
+    <div class="pad" id="mid" data-k="17">●</div>
+  </div>
+  <div id="btns" class="padgroup">
+    <div class="pad" id="bSel" data-k="17">SELECT</div>
+    <div class="pad" id="bBack" data-k="16">BACK</div>
+  </div>
+</div>
+
+<script type="module">
+import { RG, awtKey, awtChar } from './rg.js';
+
+const PAKS = ['base.pak','fonts.pak','menus.pak','intro.pak','levels.pak',
+              'gameplay.pak','gameplay2.pak','story.pak','fight.pak'];
+const SAVES = ['settings.cfg','single_player_game.save','achievements.dat',
+               'quickmatch.save'];
+const ENTRY = 0x1014f74e, W = 240, H = 320;
+
+const $ = (s) => document.querySelector(s);
+const barFill = $('#bar > div'), statusEl = $('#status'), startBtn = $('#start');
+
+// ---- IndexedDB for save persistence -----------------------------------
+const DB = 'resetgen', STORE = 'saves';
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(DB, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore(STORE);
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbGet(k) {
+  try { const db = await idb(); return await new Promise((res) => {
+    const t = db.transaction(STORE).objectStore(STORE).get(k);
+    t.onsuccess = () => res(t.result); t.onerror = () => res(null); }); }
+  catch { return null; }
+}
+async function idbSet(k, v) {
+  try { const db = await idb(); return await new Promise((res) => {
+    const t = db.transaction(STORE, 'readwrite').objectStore(STORE).put(v, k);
+    t.onsuccess = () => res(true); t.onerror = () => res(false); }); }
+  catch { return false; }
+}
+
+// ---- asset fetch with progress ----------------------------------------
+async function fetchProgress(url, onChunk) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('fetch ' + url + ' ' + r.status);
+  const total = +r.headers.get('content-length') || 0;
+  if (!r.body) { const b = new Uint8Array(await r.arrayBuffer()); onChunk(b.length, total || b.length); return b; }
+  const reader = r.body.getReader(); const parts = []; let got = 0;
+  for (;;) { const { done, value } = await reader.read(); if (done) break;
+    parts.push(value); got += value.length; onChunk(got, total); }
+  const out = new Uint8Array(got); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+const rg = new RG();
+let running = false, raf = 0, lastT = 0, audioCtx = null, audioNode = null;
+let ring = new Float32Array(48000), ringR = 0, ringW = 0, audioSrcPos = 0;
+const ctxCanvas = document.createElement('canvas'); ctxCanvas.width = W; ctxCanvas.height = H;
+const octx = ctxCanvas.getContext('2d');
+const imgData = octx.createImageData(W, H);
+const screen = $('#screen'), sctx = screen.getContext('2d');
+sctx.imageSmoothingEnabled = false;
+
+function resize() {
+  const availW = window.innerWidth, availH = window.innerHeight;
+  const scale = Math.max(1, Math.floor(Math.min(availW / W, availH / H)));
+  screen.style.width = (W * scale) + 'px';
+  screen.style.height = (H * scale) + 'px';
+}
+window.addEventListener('resize', resize);
+
+async function boot() {
+  const steps = PAKS.length + 2;   // wasm + image + paks
+  let done = 0;
+  const bump = (frac) => { barFill.style.width = ((done + frac) / steps * 100) + '%'; };
+
+  statusEl.textContent = 'Downloading engine…';
+  const wasm = await fetchProgress('reset.wasm', (g, t) => bump(t ? g / t : 0.5));
+  done++; bump(0);
+  await rg.load(wasm);
+  rg.onLog = (s) => console.log('[rg]', s);
+  rg.onAbort = (s) => { statusEl.textContent = 'Error: ' + s; throw new Error(s); };
+  rg.setup();
+
+  statusEl.textContent = 'Downloading game image…';
+  const image = await fetchProgress('rg_image.bin', (g, t) => bump(t ? g / t : 0.5));
+  done++; rg.loadImage(image);
+
+  for (const pak of PAKS) {
+    statusEl.textContent = 'Loading ' + pak + '…';
+    const bytes = await fetchProgress('data/' + pak, (g, t) => bump(t ? g / t : 0.5));
+    rg.addFile(pak, bytes);
+    done++; bump(0);
+  }
+
+  // Restore saved files (override shipped defaults).
+  for (const s of SAVES) {
+    const saved = await idbGet(s);
+    if (saved) rg.addFile(s, new Uint8Array(saved));
+  }
+
+  statusEl.textContent = 'Starting…';
+  rg.boot(ENTRY);
+  rg.init(W, H, 0);
+  for (const pak of PAKS) rg.notifyPak(pak);
+
+  startBtn.disabled = false;
+  startBtn.textContent = 'Play';
+  statusEl.textContent = 'Ready';
+}
+
+function blit() {
+  const f = rg.frame();                 // Uint8ClampedArray RGBA
+  imgData.data.set(f);
+  octx.putImageData(imgData, 0, 0);
+  sctx.drawImage(ctxCanvas, 0, 0, W, H, 0, 0, screen.width, screen.height);
+}
+
+// ---- audio pump: pull 8kHz PCM, resample into a ring the node drains ---
+function pumpAudio(dtSec) {
+  if (!audioCtx) return;
+  let need = Math.min(8000 * dtSec * 1.1, 4096 / 2);  // samples to top up
+  while (need > 0) {
+    const pcm = rg.soundFill(1024);     // 512 samples
+    for (let i = 0; i < pcm.length; i++) {
+      ring[ringW] = pcm[i] / 32768;
+      ringW = (ringW + 1) % ring.length;
+      if (ringW === ringR) ringR = (ringR + 1) % ring.length; // overflow drop
+    }
+    need -= pcm.length;
+  }
+}
+function startAudio() {
+  if (audioCtx) return;
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const rate = audioCtx.sampleRate, step = 8000 / rate;
+    audioNode = audioCtx.createScriptProcessor(2048, 0, 1);
+    audioNode.onaudioprocess = (e) => {
+      const out = e.outputBuffer.getChannelData(0);
+      for (let i = 0; i < out.length; i++) {
+        const avail = (ringW - ringR + ring.length) % ring.length;
+        if (avail < 2) { out[i] = 0; continue; }
+        const idx = (ringR + Math.floor(audioSrcPos)) % ring.length;
+        out[i] = ring[idx];
+        audioSrcPos += step;
+        while (audioSrcPos >= 1) { audioSrcPos -= 1; ringR = (ringR + 1) % ring.length; }
+      }
+    };
+    audioNode.connect(audioCtx.destination);
+  } catch (e) { console.warn('audio unavailable', e); }
+}
+
+let saveTimer = 0;
+async function persistSaves() {
+  for (const f of rg.files()) {
+    if (f.dirty && SAVES.includes(f.name)) {
+      await idbSet(f.name, rg.fileBytes(f.index));
+      rg.clearDirty(f.index);
+    }
+  }
+}
+
+function loop(t) {
+  if (!running) return;
+  const dt = lastT ? (t - lastT) / 1000 : 0.016; lastT = t;
+  // run a few engine ticks per frame (engine tick is light; aim ~ smooth)
+  let alive = true;
+  const ticks = 2;
+  for (let i = 0; i < ticks && alive; i++) alive = rg.tick();
+  blit();
+  pumpAudio(dt);
+  if ((saveTimer += dt) > 3) { saveTimer = 0; persistSaves(); }
+  if (!alive) { running = false; return; }
+  raf = requestAnimationFrame(loop);
+}
+
+function startGame() {
+  $('#loader').style.display = 'none';
+  resize();
+  startAudio();
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  if ('ontouchstart' in window) $('#touch').classList.add('on');
+  running = true; lastT = 0; raf = requestAnimationFrame(loop);
+}
+
+// ---- input -------------------------------------------------------------
+const held = new Set();
+addEventListener('keydown', (e) => {
+  if (!running) return;
+  const code = awtKey(e);
+  if ([37,38,39,40,17,16,10,27,32,9,8].includes(code) || e.key.length === 1) e.preventDefault();
+  if (!held.has(code)) { held.add(code); rg.keyDown(performance.now(), code, awtChar(e), 1); }
+  if (e.key && e.key.length === 1) rg.keyTyped(performance.now(), e.key.charCodeAt(0));
+});
+addEventListener('keyup', (e) => {
+  if (!running) return;
+  const code = awtKey(e);
+  held.delete(code);
+  rg.keyUp(performance.now(), code, awtChar(e), 1);
+});
+addEventListener('blur', () => { if (running) rg.releaseAll(); held.clear(); });
+
+// touch buttons
+for (const el of document.querySelectorAll('.pad')) {
+  const code = +el.dataset.k;
+  const down = (ev) => { ev.preventDefault(); if (running && !held.has(code)) { held.add(code); rg.keyDown(performance.now(), code, 0xffff, 1); } };
+  const up = (ev) => { ev.preventDefault(); if (running) { held.delete(code); rg.keyUp(performance.now(), code, 0xffff, 1); } };
+  el.addEventListener('touchstart', down, { passive: false });
+  el.addEventListener('touchend', up, { passive: false });
+  el.addEventListener('touchcancel', up, { passive: false });
+  el.addEventListener('mousedown', down);
+  el.addEventListener('mouseup', up);
+  el.addEventListener('mouseleave', up);
+}
+// click on canvas -> mouse press (used for the help overlay)
+screen.addEventListener('pointerdown', () => { if (running) rg.mousePressed(1); });
+$('#gear').addEventListener('click', () => $('#touch').classList.toggle('on'));
+
+startBtn.addEventListener('click', startGame);
+addEventListener('beforeunload', () => { persistSaves(); });
+
+boot().catch((e) => { statusEl.textContent = 'Failed: ' + e.message; console.error(e); });
+</script>
+</body>
+</html>
