@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="description" content="Reset Generation (N-Gage, 2008) running in the browser: the original game code statically recompiled to WebAssembly.">
+<meta name="theme-color" content="#0b0b14">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Reset Gen">
+<title>Reset Generation</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  :root {
+    --bg: #0b0b14; --panel: #161622; --fg: #ececf4; --muted: #a0a0b8;
+    --accent: #ffb000; --accent2: #ff5a00;
+    --key: rgba(255,255,255,.09); --key-edge: rgba(255,255,255,.24); --key-on: rgba(255,176,0,.5);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none;
+    background: var(--bg); color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  }
+  button { font: inherit; color: inherit; }
+
+  /* ---- layout: the screen, plus touch controls when enabled ------------ */
+  #app {
+    position: fixed; inset: 0; display: grid; gap: 10px;
+    padding: max(10px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right))
+             max(10px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
+    grid-template: "screen" minmax(0, 1fr) / minmax(0, 1fr);
+  }
+  #app.touch {
+    grid-template: "screen screen screen" minmax(0, 1fr)
+                   "dpad   menu   btns"   auto / 1fr auto 1fr;
+  }
+  @media (orientation: landscape) {
+    #app.touch { grid-template: "dpad screen btns" minmax(0, 1fr) / auto minmax(0, 1fr) auto; }
+    #app.touch #menu { grid-area: btns; align-self: start; justify-self: end; flex-direction: row; }
+  }
+  #screen { grid-area: screen; position: relative; display: grid; place-items: center; min-width: 0; min-height: 0; }
+  canvas {
+    display: block; width: 240px; height: 320px; background: #000;
+    image-rendering: crisp-edges; image-rendering: pixelated;
+    box-shadow: 0 6px 32px rgba(0,0,0,.6); border-radius: 4px;
+  }
+
+  /* ---- overlay: loading, start, errors, help ---------------------------- */
+  #overlay {
+    position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 14px; padding: 18px; text-align: center;
+    background: rgba(11,11,20,.94); border-radius: 6px; z-index: 2;
+  }
+  #overlay[hidden] { display: none; }
+  #overlay h1 {
+    margin: 0; font-size: clamp(20px, 6vmin, 38px); letter-spacing: 2px; text-transform: uppercase;
+    color: var(--accent);
+  }
+  #overlay p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.45; max-width: 30em; }
+  #bar { width: min(380px, 80%); height: 10px; background: var(--panel); border-radius: 6px; overflow: hidden; }
+  #bar > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .15s; }
+  #status { font-size: 13px; color: var(--muted); min-height: 1.3em; }
+  #play {
+    padding: 13px 38px; font-size: 19px; font-weight: 700; cursor: pointer; border: 0;
+    border-radius: 12px; color: #141414; background: var(--accent);
+  }
+  #play:disabled { opacity: .35; cursor: default; }
+  #play:focus-visible, .icon:focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
+  .keys { font-size: 13px; color: var(--muted); }
+  .keys kbd {
+    font: 600 12px ui-monospace, monospace; padding: 2px 6px; border-radius: 5px;
+    background: var(--panel); border: 1px solid var(--key-edge); color: var(--fg);
+  }
+  .touch-only, #app.touch .desk-only { display: none; }
+  #app.touch .touch-only { display: inline; }
+
+  /* ---- menu (sound / controls / fullscreen / help) ------------------------ */
+  #menu { grid-area: menu; display: flex; flex-direction: column; justify-content: center; gap: 10px; z-index: 3; }
+  #app:not(.touch) #menu { position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right)); flex-direction: row; }
+  .icon {
+    width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--key-edge);
+    background: var(--key); cursor: pointer; display: grid; place-items: center; padding: 0;
+  }
+  .icon svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .icon[aria-pressed="false"] { opacity: .55; }
+  .icon[hidden] { display: none; }
+
+  /* ---- touch controls ------------------------------------------------- */
+  #dpad, #btns { display: none; }
+  #app.touch #dpad, #app.touch #btns { display: flex; align-items: center; }
+  #dpad { grid-area: dpad; justify-content: center; }
+  #btns { grid-area: btns; justify-content: center; }
+  @media (orientation: landscape) { #app.touch #btns { align-self: end; } #app.touch #dpad { align-self: end; } }
+  .dpad {
+    --s: clamp(132px, 40vmin, 196px); position: relative; width: var(--s); height: var(--s); touch-action: none;
+  }
+  .dpad > div {
+    position: absolute; width: 36%; height: 36%; display: grid; place-items: center;
+    background: var(--key); border: 1px solid var(--key-edge); color: rgba(255,255,255,.75);
+  }
+  .dpad > div.on { background: var(--key-on); color: #fff; }
+  .dpad svg { width: 42%; height: 42%; fill: currentColor; }
+  .dpad .u { left: 32%; top: 0; border-radius: 10px 10px 4px 4px; }
+  .dpad .d { left: 32%; bottom: 0; border-radius: 4px 4px 10px 10px; }
+  .dpad .l { top: 32%; left: 0; border-radius: 10px 4px 4px 10px; }
+  .dpad .r { top: 32%; right: 0; border-radius: 4px 10px 10px 4px; }
+  .dpad .c { left: 32%; top: 32%; border-radius: 4px; background: rgba(255,255,255,.04); }
+  .pads { --b: clamp(64px, 19vmin, 84px); position: relative; width: calc(var(--b) * 2.1); height: calc(var(--b) * 1.9); }
+  .pad {
+    position: absolute; width: var(--b); height: var(--b); border-radius: 50%; touch-action: none;
+    display: grid; place-items: center; border: 1px solid var(--key-edge); color: #fff;
+    font-size: clamp(11px, 3.3vmin, 14px); font-weight: 700; letter-spacing: .5px;
+  }
+  .pad.sel { right: 0; top: 0; background: rgba(70,200,90,.22); }
+  .pad.back { left: 0; bottom: 0; background: rgba(230,80,80,.22); }
+  .pad.on { background: var(--key-on); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="screen">
+    <canvas id="game" width="240" height="320" role="img" aria-label="Game screen"></canvas>
+    <div id="overlay" role="dialog" aria-live="polite">
+      <h1>Reset Generation</h1>
+      <p>The 2008 N-Gage game, running from its original code: the native engine is
+         statically recompiled from x86 to WebAssembly. The game data (about 47&nbsp;MB) is cached after the first load.</p>
+      <div id="bar"><div></div></div>
+      <div id="status">Preparing…</div>
+      <button id="play" disabled>Loading…</button>
+      <div class="keys desk-only"><kbd>←↑↓→</kbd> move · <kbd>Ctrl</kbd> select · <kbd>Shift</kbd> back</div>
+      <div class="keys touch-only">D-pad to move · <b>SELECT</b> / <b>BACK</b> buttons</div>
+    </div>
+  </div>
+
+  <div id="dpad" aria-label="Direction pad">
+    <div class="dpad" id="dpadArea">
+      <div class="u" data-dir="38"><svg viewBox="0 0 10 10"><path d="M5 2 9 8H1z"/></svg></div>
+      <div class="l" data-dir="37"><svg viewBox="0 0 10 10"><path d="M2 5 8 1v8z"/></svg></div>
+      <div class="c"></div>
+      <div class="r" data-dir="39"><svg viewBox="0 0 10 10"><path d="M8 5 2 9V1z"/></svg></div>
+      <div class="d" data-dir="40"><svg viewBox="0 0 10 10"><path d="M5 8 1 2h8z"/></svg></div>
+    </div>
+  </div>
+  <div id="btns">
+    <div class="pads">
+      <div class="pad sel" data-role="select" role="button" aria-label="Select">SELECT</div>
+      <div class="pad back" data-role="back" role="button" aria-label="Back">BACK</div>
+    </div>
+  </div>
+
+  <div id="menu">
+    <button class="icon" id="soundBtn" aria-pressed="true" aria-label="Sound" title="Sound">
+      <svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4z"/><path class="wave" d="M17 9a4 4 0 0 1 0 6M19.5 6.5a8 8 0 0 1 0 11"/></svg>
+    </button>
+    <button class="icon" id="padBtn" aria-pressed="false" aria-label="On-screen controls" title="On-screen controls">
+      <svg viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="11" rx="5"/><path d="M7 10.5v4M5 12.5h4"/><circle cx="16" cy="11" r=".9"/><circle cx="18" cy="14" r=".9"/></svg>
+    </button>
+    <button class="icon" id="fsBtn" aria-label="Fullscreen" title="Fullscreen" hidden>
+      <svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+    </button>
+  </div>
+</div>
+
+<script type="module">
+import { RG, PAKS, SCREEN_W as W, SCREEN_H as H, SOUND_RATE, SOUND_CHUNK,
+         awtKey, awtChar, awtLocation } from './rg.js';
+
+const $ = (s) => document.querySelector(s);
+const app = $('#app'), canvas = $('#game'), overlay = $('#overlay');
+const barFill = $('#bar > div'), statusEl = $('#status'), playBtn = $('#play');
+const ctx2d = canvas.getContext('2d');
+const image = ctx2d.createImageData(W, H);
+
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+let rg = null, running = false, failed = false;
+
+// ---- layout ----------------------------------------------------------------
+const touchDevice = matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
+function setTouchControls(on, remember) {
+  app.classList.toggle('touch', on);
+  $('#padBtn').setAttribute('aria-pressed', String(on));
+  if (remember) store.set('rg.touch', on ? '1' : '0');
+  fit();
+}
+// Fill the space.  On low-density screens snap to whole device pixels so every
+// game pixel is the same size; at 2x density and up the difference is invisible.
+function fit() {
+  const box = $('#screen').getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  let s = Math.min(box.width / W, box.height / H);
+  if (dpr < 2 && Math.floor(s * dpr) >= 1) s = Math.floor(s * dpr) / dpr;
+  canvas.style.width = `${Math.floor(W * s)}px`;
+  canvas.style.height = `${Math.floor(H * s)}px`;
+}
+new ResizeObserver(fit).observe($('#screen'));
+const saved = store.get('rg.touch');
+setTouchControls(saved === null ? touchDevice : saved === '1', false);
+
+// ---- assets: fetched in parallel, kept in the Cache API between visits -------
+async function fetchAll(paths, onProgress) {
+  let manifest = { version: 'dev', sizes: {} };
+  try { manifest = await (await fetch('assets.json', { cache: 'no-cache' })).json(); } catch {}
+  const name = 'rg-assets-' + manifest.version;
+  let cache = null;
+  try {
+    cache = await caches.open(name);
+    for (const k of await caches.keys()) if (k.startsWith('rg-assets-') && k !== name) caches.delete(k);
+  } catch { cache = null; }
+  const total = paths.reduce((a, p) => a + (manifest.sizes[p] || 0), 0);
+  const got = new Map(paths.map((p) => [p, 0]));
+  const report = () => onProgress([...got.values()].reduce((a, b) => a + b, 0), total);
+  const read = async (resp, path) => {
+    const parts = [];
+    let n = 0;
+    const reader = resp.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value); n += value.length; got.set(path, n); report();
+    }
+    const out = new Uint8Array(n);
+    let o = 0;
+    for (const p of parts) { out.set(p, o); o += p.length; }
+    return out;
+  };
+  const one = async (path) => {
+    const want = manifest.sizes[path];
+    const cached = cache && await cache.match(path).catch(() => null);
+    if (cached) {
+      const bytes = await read(cached, path);
+      if (!want || bytes.length === want) return [path, bytes];
+    }
+    // Revalidate rather than trust the HTTP cache, which may hold a file
+    // from an earlier deployment.
+    const resp = await fetch(path, { cache: cached ? 'reload' : 'no-cache' });
+    if (!resp.ok) throw new Error(`${path}: HTTP ${resp.status}`);
+    if (cache) cache.put(path, resp.clone()).catch(() => {});
+    const bytes = await read(resp, path);
+    if (want && bytes.length !== want) throw new Error(`${path}: got ${bytes.length} bytes, expected ${want}; please reload`);
+    return [path, bytes];
+  };
+  return new Map(await Promise.all(paths.map(one)));
+}
+
+// ---- saves: whatever the game writes is mirrored to IndexedDB ------------------
+const DB = 'resetgen', STORE = 'saves';
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(DB, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore(STORE);
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbAll() {
+  try {
+    const db = await idb();
+    return await new Promise((res) => {
+      const out = [], st = db.transaction(STORE).objectStore(STORE).openCursor();
+      st.onsuccess = () => { const cur = st.result; if (!cur) return res(out); out.push([cur.key, cur.value]); cur.continue(); };
+      st.onerror = () => res(out);
+    });
+  } catch { return []; }
+}
+async function idbWrite(k, v) {
+  try {
+    const db = await idb();
+    await new Promise((res) => {
+      const os = db.transaction(STORE, 'readwrite').objectStore(STORE);
+      const r = v ? os.put(v, k) : os.delete(k);
+      r.onsuccess = r.onerror = () => res();
+    });
+  } catch {}
+}
+let persisting = false;
+async function persist() {
+  if (!rg || persisting || failed) return;
+  persisting = true;
+  try {
+    for (const f of rg.files()) {
+      if (!f.dirty || /\.pak$/i.test(f.name)) continue;
+      const bytes = f.deleted ? null : rg.fileBytes(f.index);
+      rg.clearDirty(f.index);
+      await idbWrite(f.name, bytes);
+    }
+  } finally { persisting = false; }
+}
+
+// ---- boot ------------------------------------------------------------------
+function fail(msg) {
+  failed = true; running = false;
+  overlay.hidden = false;
+  statusEl.textContent = 'Error: ' + msg;
+  playBtn.textContent = 'Reload';
+  playBtn.disabled = false;
+  playBtn.onclick = () => location.reload();
+}
+
+async function boot() {
+  if (typeof WebAssembly !== 'object') throw new Error('this browser does not support WebAssembly');
+  statusEl.textContent = 'Downloading…';
+  const paths = ['reset.wasm', 'rg_image.bin', ...PAKS.map((p) => 'data/' + p)];
+  const mb = (n) => (n / 1048576).toFixed(1);
+  const files = await fetchAll(paths, (n, total) => {
+    barFill.style.width = total ? `${Math.min(100, n / total * 100)}%` : '50%';
+    statusEl.textContent = total ? `Downloading ${mb(n)} / ${mb(total)} MB` : `Downloading ${mb(n)} MB`;
+  });
+  barFill.style.width = '100%';
+  statusEl.textContent = 'Starting the engine…';
+  await new Promise(requestAnimationFrame);
+
+  rg = window.rg = new RG();   // exposed for debugging from the console
+  rg.pause();                  // the game's clock starts with the first frame
+  rg.onLog = (s) => console.log('[rg]', s.trimEnd());
+  rg.onAbort = (s) => { fail(s); throw new Error(s); };
+  await rg.load(files.get('reset.wasm'));
+  rg.setup();
+  rg.loadImage(files.get('rg_image.bin'));
+  for (const p of PAKS) rg.addFile(p, files.get('data/' + p));
+  for (const [name, bytes] of await idbAll()) rg.addFile(name, new Uint8Array(bytes));
+  rg.boot();
+  rg.init(W, H, 0);
+  for (const p of PAKS) rg.notifyPak(p);
+  // The first frames are slow (one-time setup, first-run compilation): run
+  // them now, with the game's clock still stopped, so play starts smoothly.
+  for (let i = 0; i < 3; i++) { rg.tick(); await new Promise(requestAnimationFrame); }
+  rg.sleepMs();
+  refreshKeys();
+
+  statusEl.textContent = 'Ready';
+  playBtn.textContent = '▶ Play';
+  playBtn.disabled = false;
+  if (!app.classList.contains('touch')) playBtn.focus();   // Enter/Space to start
+}
+
+function start() {
+  if (running || failed || !rg || !rg.alive) return;
+  overlay.hidden = true;
+  startAudio();
+  running = true;
+  rg.resume();
+  requestWakeLock();
+  requestAnimationFrame(frame);
+}
+playBtn.addEventListener('click', start);
+
+// ---- main loop: the engine paces itself at 30 fps through Sleep() ------------
+let lastPersist = 0;
+function frame(now) {
+  if (!running) return;
+  pollGamepads();
+  try {
+    if (rg.pump(performance.now())) {
+      rg.frameInto(image.data);
+      ctx2d.putImageData(image, 0, 0);
+    }
+  } catch (e) { if (!failed) fail(e.message); return; }
+  if (!rg.alive) {             // the player chose Quit
+    running = false;
+    persist();
+    statusEl.textContent = 'The game has exited.';
+    playBtn.textContent = 'Restart';
+    playBtn.onclick = () => location.reload();
+    overlay.hidden = false;
+    return;
+  }
+  if (now - lastPersist > 2000) { lastPersist = now; refreshKeys(); persist(); }
+  requestAnimationFrame(frame);
+}
+
+// ---- audio: pulled from the engine on demand, like the Java sound thread ------
+let actx = null, gain = null;
+const FIFO = 8192, fifo = new Float32Array(FIFO);
+let fr = 0, fw = 0, fcount = 0, frac = 0;
+let muted = store.get('rg.muted') === '1';
+function refill() {
+  let pcm;
+  try { pcm = running ? rg.soundFill(SOUND_CHUNK) : null; } catch { pcm = null; }
+  const n = SOUND_CHUNK / 2;
+  for (let i = 0; i < n; i++) { fifo[fw] = pcm ? pcm[i] / 32768 : 0; fw = (fw + 1) % FIFO; }
+  fcount += n;
+}
+function startAudio() {
+  if (actx) { actx.resume(); return; }
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    actx = new AC();
+    gain = actx.createGain();
+    gain.gain.value = muted ? 0 : 1;
+    gain.connect(actx.destination);
+    const proc = actx.createScriptProcessor(2048, 1, 1);
+    const step = SOUND_RATE / actx.sampleRate;
+    proc.onaudioprocess = (e) => {
+      const out = e.outputBuffer.getChannelData(0);
+      for (let i = 0; i < out.length; i++) {
+        while (fcount < 2) refill();
+        const a = fifo[fr], b = fifo[(fr + 1) % FIFO];
+        out[i] = a + (b - a) * frac;          // linear interpolation from 8 kHz
+        frac += step;
+        while (frac >= 1) { frac -= 1; fr = (fr + 1) % FIFO; fcount--; }
+      }
+    };
+    proc.connect(gain);
+    actx.resume();
+  } catch (e) { console.warn('audio unavailable', e); }
+}
+function setMuted(m) {
+  muted = m;
+  store.set('rg.muted', m ? '1' : '0');
+  if (gain) gain.gain.value = m ? 0 : 1;
+  $('#soundBtn').setAttribute('aria-pressed', String(!m));
+  $('#soundBtn .wave').style.display = m ? 'none' : '';
+}
+setMuted(muted);
+$('#soundBtn').addEventListener('click', () => { setMuted(!muted); if (running) startAudio(); });
+
+// ---- input -------------------------------------------------------------------
+// Keys are reference counted so keyboard, touch and gamepad can overlap.
+const keys = { select: 17, back: 16 };
+function refreshKeys() {
+  keys.select = rg.selectKey() || 17;
+  keys.back = rg.backKey() || 16;
+}
+const held = new Map();
+function press(code, loc = 1) {
+  const n = (held.get(code) || 0) + 1;
+  held.set(code, n);
+  if (n === 1 && running) rg.keyDown(performance.now(), code, 0xffff, loc);
+}
+function release(code, loc = 1) {
+  const n = (held.get(code) || 0) - 1;
+  if (n > 0) { held.set(code, n); return; }
+  held.delete(code);
+  if (n === 0 && running) rg.keyUp(performance.now(), code, 0xffff, loc);
+}
+function releaseEverything() {
+  held.clear();
+  dpadPointers.clear();
+  for (const el of document.querySelectorAll('.on')) el.classList.remove('on');
+  if (running) rg.releaseAll();
+}
+
+const GAME_KEYS = new Set([37, 38, 39, 40, 16, 17, 32, 10, 27, 8, 9]);
+const kbdDown = new Set();
+addEventListener('keydown', (e) => {
+  if (!running) {
+    if ((e.key === 'Enter' || e.key === ' ') && !playBtn.disabled && !failed && document.activeElement !== playBtn) start();
+    return;
+  }
+  const code = awtKey(e);
+  const shortcut = (e.ctrlKey || e.metaKey || e.altKey) && !GAME_KEYS.has(code);
+  if (shortcut) return;                                  // leave browser shortcuts alone
+  if (GAME_KEYS.has(code) || e.key.length === 1) e.preventDefault();
+  if (!kbdDown.has(code)) {                              // the Java host dropped auto-repeat
+    kbdDown.add(code);
+    const n = (held.get(code) || 0) + 1;
+    held.set(code, n);
+    if (n === 1) rg.keyDown(performance.now(), code, awtChar(e), awtLocation(e));
+  }
+  if (e.key.length === 1) rg.keyTyped(performance.now(), e.key.charCodeAt(0));
+});
+addEventListener('keyup', (e) => {
+  if (!running) return;
+  const code = awtKey(e);
+  if (!kbdDown.delete(code)) return;
+  const n = (held.get(code) || 0) - 1;
+  if (n > 0) { held.set(code, n); return; }
+  held.delete(code);
+  rg.keyUp(performance.now(), code, awtChar(e), awtLocation(e));
+});
+addEventListener('blur', () => { kbdDown.clear(); releaseEverything(); });
+
+// D-pad: one pointer can slide between directions; a small dead zone in the middle.
+const dpad = $('#dpadArea');
+const dpadPointers = new Map();
+function dpadDir(ev) {
+  const r = dpad.getBoundingClientRect();
+  const x = ev.clientX - (r.left + r.width / 2), y = ev.clientY - (r.top + r.height / 2);
+  if (Math.hypot(x, y) < r.width * 0.12) return 0;
+  return Math.abs(x) > Math.abs(y) ? (x > 0 ? 39 : 37) : (y > 0 ? 40 : 38);
+}
+function setDir(id, code) {
+  const prev = dpadPointers.get(id) || 0;
+  if (prev === code) return;
+  if (prev) { release(prev); dpad.querySelector(`[data-dir="${prev}"]`).classList.remove('on'); }
+  if (code) { press(code); dpad.querySelector(`[data-dir="${code}"]`).classList.add('on'); buzz(); }
+  dpadPointers.set(id, code);
+}
+dpad.addEventListener('pointerdown', (ev) => {
+  ev.preventDefault();
+  dpad.setPointerCapture(ev.pointerId);
+  setDir(ev.pointerId, dpadDir(ev));
+});
+dpad.addEventListener('pointermove', (ev) => { if (dpadPointers.has(ev.pointerId)) setDir(ev.pointerId, dpadDir(ev)); });
+for (const t of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+  dpad.addEventListener(t, (ev) => { if (dpadPointers.has(ev.pointerId)) { setDir(ev.pointerId, 0); dpadPointers.delete(ev.pointerId); } });
+}
+
+// SELECT/BACK send whatever keys the engine reports (they can be remapped in
+// its Custom Keys menu); each touch releases the key it pressed.
+for (const pad of document.querySelectorAll('.pad')) {
+  const touches = new Map();
+  const up = (ev) => {
+    const code = touches.get(ev.pointerId);
+    if (code === undefined) return;
+    touches.delete(ev.pointerId);
+    if (!touches.size) pad.classList.remove('on');
+    release(code, 2);
+  };
+  pad.addEventListener('pointerdown', (ev) => {
+    ev.preventDefault();
+    pad.setPointerCapture(ev.pointerId);
+    const code = keys[pad.dataset.role];
+    touches.set(ev.pointerId, code);
+    pad.classList.add('on');
+    press(code, 2);
+    buzz();
+  });
+  for (const t of ['pointerup', 'pointercancel', 'lostpointercapture']) pad.addEventListener(t, up);
+}
+function buzz() { if (navigator.vibrate) try { navigator.vibrate(8); } catch {} }
+
+// Gamepads: d-pad / left stick move, A/Start select, B back.
+const padState = new Map();
+function pollGamepads() {
+  if (!navigator.getGamepads) return;
+  for (const gp of navigator.getGamepads()) {
+    if (!gp) continue;
+    const ax = gp.axes[0] || 0, ay = gp.axes[1] || 0, b = (i) => !!(gp.buttons[i] && gp.buttons[i].pressed);
+    const want = new Set();
+    if (b(12) || ay < -0.5) want.add(38);
+    if (b(13) || ay > 0.5) want.add(40);
+    if (b(14) || ax < -0.5) want.add(37);
+    if (b(15) || ax > 0.5) want.add(39);
+    if (b(0) || b(9)) want.add(keys.select);
+    if (b(1) || b(8)) want.add(keys.back);
+    const prev = padState.get(gp.index) || new Set();
+    for (const k of want) if (!prev.has(k)) press(k);
+    for (const k of prev) if (!want.has(k)) release(k);
+    padState.set(gp.index, want);
+  }
+}
+
+// Tapping the screen area brings the touch controls back if they were hidden.
+$('#screen').addEventListener('pointerdown', (ev) => {
+  if (ev.pointerType === 'touch' && !app.classList.contains('touch')) setTouchControls(true, true);
+});
+$('#padBtn').addEventListener('click', () => setTouchControls(!app.classList.contains('touch'), true));
+
+// ---- fullscreen, wake lock, visibility ----------------------------------------
+const fsBtn = $('#fsBtn');
+if (document.fullscreenEnabled) {
+  fsBtn.hidden = false;
+  fsBtn.addEventListener('click', async () => {
+    if (document.fullscreenElement) { await document.exitFullscreen().catch(() => {}); return; }
+    await document.documentElement.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
+    if (screen.orientation && screen.orientation.lock) screen.orientation.lock('portrait').catch(() => {});
+  });
+}
+let wakeLock = null;
+async function requestWakeLock() {
+  try { if (navigator.wakeLock && !wakeLock) wakeLock = await navigator.wakeLock.request('screen'); wakeLock?.addEventListener('release', () => { wakeLock = null; }); } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    kbdDown.clear(); releaseEverything(); persist();
+    if (rg) rg.pause();
+    if (actx) actx.suspend();
+  } else if (running) {
+    rg.resume();
+    if (actx) actx.resume();
+    requestWakeLock();
+  }
+});
+addEventListener('pagehide', () => persist());
+
+boot().catch((e) => { console.error(e); if (!failed) fail(e.message || String(e)); });
+</script>
+</body>
+</html>

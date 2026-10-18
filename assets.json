@@ -1,0 +1,16 @@
+{
+ "version": "286fe28ed09f4b23",
+ "sizes": {
+  "reset.wasm": 13932770,
+  "rg_image.bin": 1892352,
+  "data/base.pak": 586760,
+  "data/fight.pak": 2979428,
+  "data/fonts.pak": 2139083,
+  "data/gameplay.pak": 15716648,
+  "data/gameplay2.pak": 13724,
+  "data/intro.pak": 783114,
+  "data/levels.pak": 11078,
+  "data/menus.pak": 3700255,
+  "data/story.pak": 5171627
+ }
+}
