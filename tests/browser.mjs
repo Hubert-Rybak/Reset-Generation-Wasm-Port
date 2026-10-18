@@ -69,7 +69,10 @@ async function scenario(browser, url, name, ctxOpts, mobile) {
   check(info.nonblack > 20000, `game renders (nonblack=${info.nonblack}, canvas ${info.w.toFixed(0)}x${info.h.toFixed(0)})`);
   if (mobile) {
     const cv = await rect(page, '#game'), dp = await rect(page, '#dpadArea'), sel = await rect(page, '.pad.sel');
-    check(!overlaps(cv, dp) && !overlaps(cv, sel), 'controls do not cover the game screen');
+    const bk = await rect(page, '.pad.back');
+    const inView = (r) => r.x >= -1 && r.y >= -1 && r.x + r.w <= ctxOpts.viewport.width + 1 && r.y + r.h <= ctxOpts.viewport.height + 1;
+    check(!overlaps(cv, dp) && !overlaps(cv, sel) && !overlaps(cv, bk), 'controls do not cover the game screen');
+    check([cv, dp, sel, bk].every(inView), 'screen and controls fit the viewport');
     check(cv.w >= 240, 'game screen at least 1x');
   }
   await page.screenshot({ path: path.join(OUT, `pw_${name}_intro.png`) });
@@ -137,11 +140,14 @@ if (!url) {
   server = await serve(path.join(ROOT, 'dist'));
   url = `http://127.0.0.1:${server.address().port}/`;
 }
-const browser = await chromium.launch({ executablePath: CHROME, args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required'] });
+const proxy = server || !process.env.HTTPS_PROXY ? undefined : { server: process.env.HTTPS_PROXY };
+const browser = await chromium.launch({ executablePath: CHROME, proxy, args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required'] });
 try {
   await scenario(browser, url, 'desktop', { viewport: { width: 1280, height: 800 } }, false);
   await scenario(browser, url, 'phone', { ...devices['iPhone 13'], defaultBrowserType: undefined }, true);
   await scenario(browser, url, 'phone_landscape', { ...devices['iPhone 13 landscape'], defaultBrowserType: undefined }, true);
+  await scenario(browser, url, 'small_phone', { ...devices['iPhone SE'], defaultBrowserType: undefined }, true);
+  await scenario(browser, url, 'android', { ...devices['Pixel 7'], defaultBrowserType: undefined }, true);
 } finally {
   await browser.close();
   if (server) server.close();

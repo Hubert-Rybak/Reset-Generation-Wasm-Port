@@ -142,7 +142,7 @@ npm install                 # playwright-core, for the browser test only
 node tests/run.mjs          # boot + 20 s of simulated time -> build/frame.png
 node tests/play.mjs         # scripted playthrough into a level -> build/playthrough.png
 node tests/soak.mjs 15      # 15 simulated minutes of random input
-node tests/browser.mjs [url] # Chromium: desktop, phone and landscape phone
+node tests/browser.mjs [url] # Chromium: desktop and four phone profiles
 ```
 
 The browser test checks:
@@ -154,13 +154,13 @@ The browser test checks:
 ## Deploying
 
 The site is static. GitHub Pages serves the `gh-pages` branch, which holds the
-contents of `dist/` plus a `.nojekyll` file:
+contents of `dist/` (including a `.nojekyll` file). To build and publish:
 
 ```sh
-./build.sh
-git worktree add /tmp/pages gh-pages && rsync -a --delete --exclude .git dist/ /tmp/pages/
-git -C /tmp/pages add -A && git -C /tmp/pages commit -m "Deploy" && git -C /tmp/pages push origin gh-pages
+./deploy.sh
 ```
+
+GitHub Pages compresses the files on the fly; the wasm downloads as about 2.3 MB.
 
 ## Status and limitations
 
