@@ -1,0 +1,17 @@
+{
+  "name": "reset-generation-wasm-port",
+  "version": "1.1.0",
+  "description": "WebAssembly port of the N-Gage game Reset Generation via static recompilation of its native engine.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "./build.sh",
+    "serve": "python3 -m http.server -d dist 8080",
+    "test": "node tests/run.mjs && node tests/play.mjs",
+    "test:browser": "node tests/browser.mjs",
+    "test:soak": "node tests/soak.mjs 15"
+  },
+  "devDependencies": {
+    "playwright-core": "1.49.1"
+  }
+}
