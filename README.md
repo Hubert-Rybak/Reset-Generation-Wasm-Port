@@ -145,7 +145,8 @@ node tests/soak.mjs 15      # 15 simulated minutes of random input
 node tests/browser.mjs [url] # Chromium: desktop and four phone profiles
 ```
 
-The browser test checks:
+`tests/browser.mjs` drives Chromium through `playwright-core`; set `CHROME` to the
+browser binary if it is not at the default path. It checks:
 - that the touch controls appear on load and never cover the screen;
 - that the game renders and reacts to input;
 - that it runs at 30 ticks/s;
