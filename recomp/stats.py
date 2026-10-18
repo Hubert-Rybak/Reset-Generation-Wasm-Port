@@ -1,6 +1,7 @@
 """Report code discovery coverage for a PE image (development aid)."""
 
 import collections
+import os
 import sys
 import time
 
@@ -64,15 +65,14 @@ def main(path):
     print(f"{len(an.noreturn)} noreturn functions: {[hex(x) for x in sorted(an.noreturn)][:40]}")
     tails = sum(len(f.tailcalls) for f in funcs.values())
     print(f"{tails} tail calls, {sum(len(f.tables) for f in funcs.values())} jump tables")
-    mn = collections.Counter()
-    for va in uniq:
-        mn[ix.Mnemonic.__dict__ and an.cache[va].ins.code] += 1
+    mn = collections.Counter(an.cache[va].ins.code for va in uniq)
     names = {v: k for k, v in ix.Code.__dict__.items() if not k.startswith("_")}
-    print(f"{len(mn)} distinct opcode forms")
-    with open("/tmp/claude-0/-home-user-Reset-Generation-Wasm-Port/2e3f0edd-734c-55ca-9573-b47b46f2da25/scratchpad/codes.txt", "w") as fo:
-        for c, n in mn.most_common():
-            fo.write(f"{n:8d} {names.get(c, c)}\n")
+    print(f"{len(mn)} distinct opcode forms:")
+    for c, n in mn.most_common():
+        print(f"{n:8d} {names.get(c, c)}")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(sys.argv[1] if len(sys.argv) > 1 else
+         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "original",
+                      "ResetGeneration", "ResetGeneration-Win32-Web.dll"))

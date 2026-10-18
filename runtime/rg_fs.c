@@ -6,32 +6,38 @@ typedef struct {
   u8  *data;      /* host pointer */
   u32  size;
   u32  cap;
-  int  used;
-  int  dirty;
+  u8   used;      /* slot holds a live file */
+  u8   dirty;     /* changed since the embedder last persisted it */
+  u8   deleted;   /* removed by the game; the embedder should drop its copy */
 } File;
 
 static File g_files[RG_FS_MAX];
 static int g_nfiles;
 
-typedef struct {
-  int file;
-  u32 pos;
-  int writable;
-  int used;
-} Handle;
+typedef struct { int file; u32 pos; int used; } Handle;
 #define RG_MAXH 32
+#define HBASE 0x40000000u   /* file handles are HBASE + slot */
 static Handle g_handles[RG_MAXH];
-#define HBASE 0x40000000u   /* file handles encoded as HBASE+index */
+
+/* The CRT's _findclose is not linked into the game, so it never closes its
+ * find handles; when all slots are taken the least recently used is reused. */
+typedef struct { char pattern[64]; int pos; int used; u32 stamp; } Finder;
+#define RG_MAXF 8
+#define FBASE 0x46100000u   /* find handles are FBASE + slot */
+static Finder g_finders[RG_MAXF];
+static u32 g_find_clock;
 
 void rg_fs_init(void) {
   g_nfiles = 0;
-  for (int i = 0; i < RG_FS_MAX; i++) g_files[i].used = 0;
-  for (int i = 0; i < RG_MAXH; i++) g_handles[i].used = 0;
+  rg_memset(g_files, 0, sizeof g_files);
+  rg_memset(g_handles, 0, sizeof g_handles);
+  rg_memset(g_finders, 0, sizeof g_finders);
 }
 
+/* ---- names ------------------------------------------------------------- */
 static const char *basename_of(const char *p) {
   const char *b = p;
-  for (const char *q = p; *q; q++) if (*q == '/' || *q == '\\') b = q + 1;
+  for (const char *q = p; *q; q++) if (*q == '/' || *q == '\\' || *q == ':') b = q + 1;
   return b;
 }
 
@@ -41,44 +47,99 @@ static void copyname(char *dst, const char *src) {
   dst[i] = 0;
 }
 
-static int streq(const char *a, const char *b) {
-  while (*a && *b) { if (*a != *b) return 0; a++; b++; }
-  return *a == *b;
+static int lower(int ch) { return ch >= 'A' && ch <= 'Z' ? ch + 32 : ch; }
+
+static int name_eq(const char *a, const char *b) {
+  while (*a && lower((u8)*a) == lower((u8)*b)) { a++; b++; }
+  return lower((u8)*a) == lower((u8)*b);
 }
 
-int rg_fs_add(const char *name, const u8 *data, u32 size) {
-  if (g_nfiles >= RG_FS_MAX) return -1;
-  int i = g_nfiles++;
-  copyname(g_files[i].name, basename_of(name));
-  u8 *buf = (u8 *)rg_host_alloc(size ? size : 1);
-  for (u32 k = 0; k < size; k++) buf[k] = data[k];
-  g_files[i].data = buf;
-  g_files[i].size = size;
-  g_files[i].cap = size;
-  g_files[i].used = 1;
-  g_files[i].dirty = 0;
-  return i;
+/* Windows-style wildcard match: `*` any run, `?` any one character. */
+static int wild(const char *p, const char *s) {
+  for (; *p; p++, s++) {
+    if (*p == '*') {
+      while (p[1] == '*') p++;
+      if (!p[1]) return 1;
+      for (; *s; s++) if (wild(p + 1, s)) return 1;
+      return 0;
+    }
+    if (!*s || (*p != '?' && lower((u8)*p) != lower((u8)*s))) return 0;
+  }
+  return *s == 0;
 }
 
-int rg_fs_find(const char *basename) {
-  const char *b = basename_of(basename);
+static int pattern_match(const char *pat, const char *name) {
+  if (name_eq(pat, "*.*")) return 1;            /* also matches names without a dot */
+  return wild(pat, name);
+}
+
+/* ---- files -------------------------------------------------------------- */
+int rg_fs_find(const char *path) {
+  const char *b = basename_of(path);
   for (int i = 0; i < g_nfiles; i++)
-    if (g_files[i].used && streq(g_files[i].name, b)) return i;
+    if (g_files[i].used && name_eq(g_files[i].name, b)) return i;
   return -1;
 }
 
-int rg_fs_create(const char *basename) {
-  int i = rg_fs_find(basename);
-  if (i >= 0) { g_files[i].size = 0; g_files[i].dirty = 1; return i; }
-  if (g_nfiles >= RG_FS_MAX) return -1;
-  i = g_nfiles++;
-  copyname(g_files[i].name, basename_of(basename));
-  g_files[i].cap = 4096;
-  g_files[i].data = (u8 *)rg_host_alloc(g_files[i].cap);
-  g_files[i].size = 0;
-  g_files[i].used = 1;
-  g_files[i].dirty = 1;
+/* A slot for `name`: a pending deletion of the same name, a recycled slot,
+ * or a fresh one. */
+static int new_slot(const char *name) {
+  int free_slot = -1;
+  for (int i = 0; i < g_nfiles; i++) {
+    File *f = &g_files[i];
+    if (f->used) continue;
+    if (f->deleted && name_eq(f->name, name)) return i;
+    if (!f->dirty && free_slot < 0) free_slot = i;
+  }
+  if (free_slot >= 0) return free_slot;
+  return g_nfiles < RG_FS_MAX ? g_nfiles++ : -1;
+}
+
+int rg_fs_add(const char *name, u8 *data, u32 size) {
+  const char *b = basename_of(name);
+  int i = rg_fs_find(b);
+  if (i < 0) i = new_slot(b);
+  if (i < 0) return -1;
+  File *f = &g_files[i];
+  copyname(f->name, b);
+  f->data = data;
+  f->size = f->cap = size;
+  f->used = 1;
+  f->dirty = f->deleted = 0;
   return i;
+}
+
+int rg_fs_create(const char *path) {
+  int i = rg_fs_find(path);
+  if (i < 0) {
+    const char *b = basename_of(path);
+    i = new_slot(b);
+    if (i < 0) return -1;
+    File *f = &g_files[i];
+    copyname(f->name, b);
+    if (!f->data || f->cap == 0) {
+      f->cap = 4096;
+      f->data = (u8 *)rg_host_alloc(f->cap);
+    }
+  }
+  File *f = &g_files[i];
+  f->size = 0;
+  f->used = 1;
+  f->deleted = 0;
+  f->dirty = 1;
+  return i;
+}
+
+int rg_fs_delete(const char *path) {
+  int i = rg_fs_find(path);
+  if (i < 0) return 0;
+  for (int h = 0; h < RG_MAXH; h++)       /* Windows refuses to delete open files */
+    if (g_handles[h].used && g_handles[h].file == i) return 0;
+  g_files[i].used = 0;
+  g_files[i].deleted = 1;
+  g_files[i].dirty = 1;
+  g_files[i].size = 0;
+  return 1;
 }
 
 int rg_fs_count(void) { return g_nfiles; }
@@ -86,39 +147,31 @@ const char *rg_fs_name(int i) { return g_files[i].name; }
 u8 *rg_fs_data(int i) { return g_files[i].data; }
 u32 rg_fs_len(int i) { return g_files[i].size; }
 int rg_fs_dirty(int i) { return g_files[i].dirty; }
+int rg_fs_deleted(int i) { return g_files[i].deleted; }
 void rg_fs_clear_dirty(int i) { g_files[i].dirty = 0; }
 
-static void ensure_cap(int fi, u32 need) {
-  File *f = &g_files[fi];
+static void ensure_cap(File *f, u32 need) {
   if (need <= f->cap) return;
   u32 nc = f->cap ? f->cap : 4096;
-  while (nc < need) nc *= 2;
+  while (nc < need) nc = nc * 2 > nc ? nc * 2 : need;
   u8 *nb = (u8 *)rg_host_alloc(nc);
-  for (u32 k = 0; k < f->size; k++) nb[k] = f->data[k];
+  rg_memcpy(nb, f->data, f->size);
   f->data = nb;
   f->cap = nc;
 }
 
-u32 rg_fs_open(const char *path, int create, int truncate) {
-  int fi = rg_fs_find(path);
-  if (fi < 0) {
-    if (!create) return 0xffffffffu;   /* INVALID_HANDLE_VALUE */
-    fi = rg_fs_create(path);
-    if (fi < 0) return 0xffffffffu;
-  } else if (truncate) {
-    g_files[fi].size = 0;
-    g_files[fi].dirty = 1;
-  }
+/* ---- handles ------------------------------------------------------------ */
+u32 rg_fs_open(int fi) {
+  if (fi < 0) return RG_FS_BAD;
   for (int h = 0; h < RG_MAXH; h++) {
     if (!g_handles[h].used) {
       g_handles[h].used = 1;
       g_handles[h].file = fi;
       g_handles[h].pos = 0;
-      g_handles[h].writable = create || truncate;
       return HBASE + h;
     }
   }
-  return 0xffffffffu;
+  return RG_FS_BAD;
 }
 
 int rg_fs_is_handle(u32 h) {
@@ -130,7 +183,7 @@ u32 rg_fs_read(u32 h, u32 guest_buf, u32 n) {
   File *f = &g_files[H->file];
   u32 avail = f->size > H->pos ? f->size - H->pos : 0;
   if (n > avail) n = avail;
-  for (u32 k = 0; k < n; k++) *(u8 *)GPTR(guest_buf + k) = f->data[H->pos + k];
+  rg_memcpy(GPTR(guest_buf), f->data + H->pos, n);
   H->pos += n;
   return n;
 }
@@ -138,64 +191,73 @@ u32 rg_fs_read(u32 h, u32 guest_buf, u32 n) {
 u32 rg_fs_write(u32 h, u32 guest_buf, u32 n) {
   Handle *H = &g_handles[h - HBASE];
   File *f = &g_files[H->file];
-  ensure_cap(H->file, H->pos + n);
-  for (u32 k = 0; k < n; k++) f->data[H->pos + k] = *(u8 *)GPTR(guest_buf + k);
+  if (!n) return 0;
+  ensure_cap(f, H->pos + n);
+  if (H->pos > f->size) rg_memset(f->data + f->size, 0, H->pos - f->size);  /* gap after a seek */
+  rg_memcpy(f->data + H->pos, GPTR(guest_buf), n);
   H->pos += n;
   if (H->pos > f->size) f->size = H->pos;
   f->dirty = 1;
   return n;
 }
 
-u32 rg_fs_seek(u32 h, i32 dist, u32 method, u32 *newpos_out) {
+int rg_fs_seek(u32 h, i64 dist, u32 method, u32 *newpos) {
   Handle *H = &g_handles[h - HBASE];
   File *f = &g_files[H->file];
   i64 base = method == 1 ? (i64)H->pos : method == 2 ? (i64)f->size : 0;
   i64 np = base + dist;
-  if (np < 0) np = 0;
+  if (method > 2 || np < 0 || np > 0x7fffffff) return 0;
   H->pos = (u32)np;
-  if (newpos_out) *newpos_out = H->pos;
-  return H->pos;
+  if (newpos) *newpos = H->pos;
+  return 1;
 }
 
-u32 rg_fs_size_of(u32 h) { return g_files[g_handles[h - HBASE].file].size; }
+void rg_fs_set_eof(u32 h) {
+  Handle *H = &g_handles[h - HBASE];
+  File *f = &g_files[H->file];
+  ensure_cap(f, H->pos);
+  if (H->pos > f->size) rg_memset(f->data + f->size, 0, H->pos - f->size);
+  f->size = H->pos;
+  f->dirty = 1;
+}
+
+u32 rg_fs_size(u32 h) { return g_files[g_handles[h - HBASE].file].size; }
 
 void rg_fs_close(u32 h) {
   if (rg_fs_is_handle(h)) g_handles[h - HBASE].used = 0;
 }
 
-/* ---- find-first/next (pattern ignored beyond extension suffix) -------- */
-static int g_find_i;
-static char g_find_suffix[16];
-
-static int suffix_match(const char *name, const char *suf) {
-  if (!suf[0]) return 1;
-  u32 ln = 0, ls = 0;
-  while (name[ln]) ln++;
-  while (suf[ls]) ls++;
-  if (ls > ln) return 0;
-  for (u32 k = 0; k < ls; k++) if (name[ln - ls + k] != suf[k]) return 0;
-  return 1;
+/* ---- find-first/next ---------------------------------------------------- */
+int rg_fs_is_find_handle(u32 fh) {
+  return fh >= FBASE && fh < FBASE + RG_MAXF && g_finders[fh - FBASE].used;
 }
 
-int rg_fs_find_first(const char *pattern) {
-  const char *b = basename_of(pattern);
-  /* capture suffix after '*' (e.g. "*.pak" -> ".pak") */
-  int i = 0; const char *p = b;
-  while (*p && *p != '*') p++;
-  if (*p == '*') p++;
-  while (*p && i < 15) g_find_suffix[i++] = *p++;
-  g_find_suffix[i] = 0;
-  g_find_i = -1;
-  return rg_fs_find_next(-2);
-}
-
-int rg_fs_find_next(int cookie) {
-  int start = (cookie == -2) ? 0 : g_find_i + 1;
-  for (int i = start; i < g_nfiles; i++) {
-    if (g_files[i].used && suffix_match(g_files[i].name, g_find_suffix)) {
-      g_find_i = i;
-      return i;
-    }
+int rg_fs_find_next(u32 fh) {
+  if (!rg_fs_is_find_handle(fh)) return -1;
+  Finder *F = &g_finders[fh - FBASE];
+  F->stamp = ++g_find_clock;
+  for (; F->pos < g_nfiles; F->pos++) {
+    File *f = &g_files[F->pos];
+    if (f->used && pattern_match(F->pattern, f->name)) return F->pos++;
   }
   return -1;
+}
+
+u32 rg_fs_find_first(const char *pattern, int *fi) {
+  int slot = 0;
+  for (int i = 0; i < RG_MAXF; i++) {
+    if (!g_finders[i].used) { slot = i; break; }
+    if (g_finders[i].stamp < g_finders[slot].stamp) slot = i;
+  }
+  Finder *F = &g_finders[slot];
+  copyname(F->pattern, basename_of(pattern));
+  F->pos = 0;
+  F->used = 1;
+  *fi = rg_fs_find_next(FBASE + slot);
+  if (*fi < 0) { F->used = 0; return RG_FS_BAD; }
+  return FBASE + slot;
+}
+
+void rg_fs_find_close(u32 fh) {
+  if (rg_fs_is_find_handle(fh)) g_finders[fh - FBASE].used = 0;
 }

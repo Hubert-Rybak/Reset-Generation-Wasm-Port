@@ -1,61 +1,79 @@
 #!/usr/bin/env bash
-# Build the ResetGeneration WASM port.
-#   ./build.sh            # regenerate C from the DLL (if needed) and link wasm
-#   ./build.sh gen        # force regenerate the recompiled C
+# Build the Reset Generation WebAssembly port.
+#   ./build.sh            # (re)generate C from the DLL if stale, compile, link, assemble dist/
+#   ./build.sh gen        # force the recompiler to run first
 set -euo pipefail
 cd "$(dirname "$0")"
 
 DLL=original/ResetGeneration/ResetGeneration-Win32-Web.dll
 GEN=runtime/gen
 
-if [ "${1:-}" = "gen" ] || [ ! -f "$GEN/rg_dispatch.c" ]; then
+stale=0
+if [ ! -f "$GEN/rg_dispatch.c" ] || [ ! -f runtime/rg_image.bin ]; then
+  stale=1
+else
+  for f in recomp/*.py "$DLL"; do
+    [ "$f" -nt "$GEN/rg_dispatch.c" ] && stale=1
+  done
+fi
+if [ "${1:-}" = "gen" ] || [ "$stale" = 1 ]; then
   echo "[*] recompiling DLL -> C"
   python3 recomp/generate.py "$DLL"
 fi
 
 mkdir -p build
-CC=clang
+CC=${CC:-clang}
+WASMLD=${WASMLD:-wasm-ld}
 CFLAGS="--target=wasm32 -O2 -ffreestanding -fno-builtin -nostdlib \
-  -Wno-implicit-function-declaration -Wno-parentheses-equality -Iruntime -Iruntime/gen \
-  -mbulk-memory -msign-ext -mmutable-globals"
+  -mbulk-memory -msign-ext -mmutable-globals \
+  -Werror=implicit-function-declaration -Wno-parentheses-equality \
+  -Iruntime -I$GEN"
 
-SRCS=(runtime/rg_host.c runtime/rg_mem.c runtime/rg_core.c \
-      runtime/rg_win32.c runtime/rg_fs.c runtime/rg_jni.c runtime/rg_api.c \
-      $GEN/rg_dispatch.c $GEN/rg_iat.c)
-for i in 0 1 2 3 4 5 6 7; do SRCS+=("$GEN/rg_gen_$i.c"); done
+SRCS=(runtime/rg_host.c runtime/rg_mem.c runtime/rg_math.c runtime/rg_core.c
+      runtime/rg_win32.c runtime/rg_fs.c runtime/rg_jni.c runtime/rg_api.c
+      "$GEN/rg_dispatch.c" "$GEN/rg_iat.c")
+for f in "$GEN"/rg_gen_*.c; do SRCS+=("$f"); done
 
 echo "[*] compiling ${#SRCS[@]} translation units"
-OBJS=()
+OBJS=() PIDS=()
 for s in "${SRCS[@]}"; do
   o="build/$(echo "$s" | tr '/.' '__').o"
-  $CC $CFLAGS -c "$s" -o "$o" &
   OBJS+=("$o")
-  # throttle to nproc parallel jobs
-  while [ "$(jobs -r | wc -l)" -ge "$(nproc)" ]; do wait -n; done
+  $CC $CFLAGS -c "$s" -o "$o" &
+  PIDS+=($!)
+  while [ "$(jobs -rp | wc -l)" -ge "$(nproc)" ]; do wait -n || true; done
 done
-wait
+fail=0
+for p in "${PIDS[@]}"; do wait "$p" || fail=1; done
+[ "$fail" = 0 ] || { echo "compilation failed" >&2; exit 1; }
 
-echo "[*] linking reset.wasm"
-wasm-ld "${OBJS[@]}" -o build/reset.wasm \
-  --no-entry --allow-undefined --export-dynamic \
-  --initial-memory=$((64*1024*1024)) --max-memory=$((1024*1024*1024)) \
-  -z stack-size=1048576 \
-  --export=rg_boot --export=rg_setup --export=rg_init --export=rg_tick --export=rg_image_ptr \
-  --export=rg_add_file --export=rg_alloc --export=rg_notify_pak \
-  --export=rg_backbuffer --export=rg_backbuffer_size --export=rg_hostptr \
-  --export=rg_key_down --export=rg_key_up --export=rg_key_typed \
-  --export=rg_mouse_pressed --export=rg_release_all --export=rg_sound_fill \
-  --export=rg_is_wait --export=rg_select_key --export=rg_back_key \
-  --export=rg_set_volume --export=__heap_base --export=memory \
-  --export=rg_file_count --export=rg_file_name --export=rg_file_ptr \
-  --export=rg_file_len --export=rg_file_dirty --export=rg_file_clear_dirty
-
+echo "[*] linking build/reset.wasm"
+# Exports come from export_name attributes in rg_api.c; the JS imports are
+# declared with import_module attributes, so any other undefined symbol fails.
+$WASMLD "${OBJS[@]}" -o build/reset.wasm --no-entry \
+  --initial-memory=$((64 * 1024 * 1024)) --max-memory=$((1024 * 1024 * 1024)) \
+  -z stack-size=$((1024 * 1024))
 ls -la build/reset.wasm
 
 echo "[*] assembling dist/"
+rm -rf dist
 mkdir -p dist/data
-cp web/index.html web/rg.js dist/
-cp build/reset.wasm dist/
-cp runtime/rg_image.bin dist/
+cp web/index.html web/rg.js web/manifest.webmanifest web/icon-192.png web/icon-512.png dist/
+cp build/reset.wasm runtime/rg_image.bin dist/
 cp original/ResetGeneration/*.pak dist/data/
+touch dist/.nojekyll   # GitHub Pages: serve the files as they are
+# Uncompressed sizes (for the progress bar) and a content hash that versions
+# the page's asset cache.
+python3 - <<'EOF'
+import hashlib, json, os
+os.chdir("dist")
+files = ["reset.wasm", "rg_image.bin"] + sorted("data/" + f for f in os.listdir("data"))
+h = hashlib.sha256()
+sizes = {}
+for f in files:
+    data = open(f, "rb").read()
+    sizes[f] = len(data)
+    h.update(f.encode() + b"\0" + data)
+json.dump({"version": h.hexdigest()[:16], "sizes": sizes}, open("assets.json", "w"), indent=1)
+EOF
 echo "[*] done -> dist/ (serve with: python3 -m http.server -d dist 8080)"

@@ -4,9 +4,7 @@ import os
 import sys
 import time
 
-import iced_x86 as ix
-
-from codegen import CodeGen, cname, impname, IMPORT_ARGBYTES
+from codegen import CodeGen, cname, impname
 from disasm import Analysis
 from pe import Image
 
@@ -65,7 +63,6 @@ def main(dll_path):
         f.write("const RGExport rg_exports[] = {\n")
         for name, va in sorted(img.exports.items()):
             if va in funcs:
-                cn = name
                 f.write(f'  {{"{name}", 0x{va:08x}u}},\n')
         f.write("  {0, 0}\n};\n")
 

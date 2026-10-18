@@ -42,11 +42,8 @@
 #define JNI_GetDirectBufferAddress 230
 #define JNI_GetDirectBufferCapacity 231
 
-#define TRAMP 0x10000000u  /* unused; real value from rg_mem.h */
-
 static u32 g_env;
 static u32 g_this;
-static const char *g_laststr = "";
 
 void rg_jni_init(void) {
   /* function table: 512 entries just after the JNIEnv* slot */
@@ -60,13 +57,11 @@ void rg_jni_init(void) {
 
 u32 rg_jni_env(void) { return g_env; }
 u32 rg_jni_this(void) { return g_this; }
-const char *rg_jstr_last(void) { return g_laststr; }
 
 u32 rg_jstr_new(const char *utf8) {
   u32 n = rg_strlen(utf8);
   u32 p = rg_heap_alloc(n + 1);
-  for (u32 i = 0; i < n; i++) Wr8(p + i, (u8)utf8[i]);
-  Wr8(p + n, 0);
+  rg_memcpy(GPTR(p), utf8, n + 1);
   return p;
 }
 
@@ -119,7 +114,7 @@ void rg_jni_call(CPU *c, u32 index) {
       if (!src) RET(2, 0);
       u32 n = guest_strlen(src);
       u32 p = rg_heap_alloc(n + 1);
-      for (u32 i = 0; i <= n; i++) Wr8(p + i, Rd8(src + i));
+      rg_memcpy(GPTR(p), GPTR(src), n + 1);
       RET(2, p);
     }
 

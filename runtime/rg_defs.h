@@ -14,16 +14,14 @@ typedef long long i64;
 /* Guest image is loaded at its preferred base, so guest VAs map linearly. */
 #define RG_GUEST_BASE 0x10000000u
 
-/* Thread information block (fs: segment) lives just below nothing special;
- * it is a fixed guest page the runtime allocates. */
+/* Guest address of the thread information block that `fs:` points at. */
 extern u32 RG_FS_BASE;
 
 /* Flat guest memory.  g_membase points at the host buffer that holds guest VA
  * RG_GUEST_BASE, so a guest VA maps to g_membase + (va - RG_GUEST_BASE).  The
  * subtraction keeps the wasm load/store offset immediate non-negative (wasm
  * bounds-checks base+offset without wrapping, so a biased base would trap). */
-extern u8 *rg_mem_at(u32 va);        /* bounds-checked slow path (debug) */
-extern u8 *g_membase;                 /* host pointer to guest VA RG_GUEST_BASE */
+extern u8 *g_membase;
 
 #define GPTR(va) (g_membase + ((va) - RG_GUEST_BASE))
 
@@ -41,11 +39,16 @@ typedef struct CPU {
   /* x87 */
   double st[8];
   int fpu_top;
-  u32 fpu_sw;   /* status word (C0..C3 in bits 8,9,10,14) */
+  u32 fpu_sw;   /* status word without TOP (C0..C3 in bits 8,9,10,14) */
   u32 fpu_cw;   /* control word */
   /* SSE */
   XMM xmm[8];
 } CPU;
+
+#define FSW_C0 (1u << 8)
+#define FSW_C1 (1u << 9)
+#define FSW_C2 (1u << 10)
+#define FSW_C3 (1u << 14)
 
 /* ---- guest memory access (unaligned little-endian) -------------------- */
 static inline u32 Rd8(u32 a)  { return *(u8 *)GPTR(a); }
@@ -66,25 +69,27 @@ void   rg_wrf80(u32 a, double v);
 
 static inline u32 rg_parity(u32 r) { return (u32)((__builtin_popcount(r & 0xff) & 1) ^ 1); }
 
-/* ---- x87 helpers ------------------------------------------------------ */
+/* ---- x87 helpers ------------------------------------------------------
+ * The register stack holds doubles.  MSVC's CRT runs the FPU at 53-bit
+ * precision, so plain double arithmetic matches the original results. */
 static inline double rg_st(CPU *c, int i) { return c->st[(c->fpu_top + i) & 7]; }
 static inline void rg_setst(CPU *c, int i, double v) { c->st[(c->fpu_top + i) & 7] = v; }
 static inline void rg_fpush(CPU *c, double v) { c->fpu_top = (c->fpu_top - 1) & 7; c->st[c->fpu_top] = v; }
 static inline void rg_fpop(CPU *c) { c->fpu_top = (c->fpu_top + 1) & 7; }
 static inline void rg_fxch(CPU *c, int i) { int a=(c->fpu_top)&7, b=(c->fpu_top+i)&7; double t=c->st[a]; c->st[a]=c->st[b]; c->st[b]=t; }
+static inline double rg_fabs(double v) { return __builtin_fabs(v); }
+static inline double rg_sqrt(double v) { return __builtin_sqrt(v); }
+static inline int    rg_isnan(double v) { return v != v; }
 void rg_fcom(CPU *c, double a, double b);
 u32  rg_fsw(CPU *c);
-void rg_fprem1(CPU *c);
 void rg_fprem(CPU *c);
-i32  rg_f2i(CPU *c, double v);
-i64  rg_f2ll(CPU *c, double v);
-double rg_rint(CPU *c, double v);
-double rg_fabs(double v);
-double rg_sqrt(double v);
-double rg_sin(double v);
-double rg_cos(double v);
-int    rg_isnan(double v);
-void   rg_ucomisd(CPU *c, double a, double b);
+void rg_fprem1(CPU *c);
+void rg_fsin(CPU *c);
+void rg_fcos(CPU *c);
+i32  rg_f2i(CPU *c, double v);      /* FIST m32: rounds per FPU control word */
+i64  rg_f2ll(CPU *c, double v);     /* FIST m64 */
+double rg_rint(CPU *c, double v);   /* FRNDINT */
+void rg_ucomisd(CPU *c, double a, double b);
 
 /* ---- control-flow helpers -------------------------------------------- */
 typedef struct { u32 addr; void (*fn)(CPU *); } RGEntry;
@@ -98,9 +103,9 @@ extern const unsigned rg_imp_count;
 extern const RGIatSlot rg_iat[];
 extern const unsigned rg_iat_count;
 
-/* Import trampoline address block: a call through an unresolved IAT slot lands
- * on one of these synthetic addresses, which the dispatcher routes to the
- * matching stdcall shim. */
+/* Import trampoline address block: every IAT slot is filled with one of these
+ * synthetic addresses, which the dispatcher routes to the matching stdcall
+ * shim (so code that loads an import address and calls it later works). */
 #define RG_IMP_TRAMP   0x101d8000u
 #define RG_IMP_STRIDE  16u
 

@@ -32,42 +32,13 @@ Code = ix.Code
 MNEM_NAME = {int(v): k for k, v in ix.Mnemonic.__dict__.items()
              if isinstance(v, int) and not k.startswith("_")}
 
-# stdcall argument byte counts for the Win32 imports we shim.
-IMPORT_ARGBYTES = {
-    "timeGetTime": 0,
-    "GetTickCount": 0, "GetCurrentThreadId": 0, "GetCurrentProcessId": 0,
-    "GetCurrentProcess": 0, "GetCommandLineA": 0, "GetLastError": 0,
-    "GetEnvironmentStrings": 0, "GetEnvironmentStringsW": 0, "GetACP": 0,
-    "GetOEMCP": 0, "SetHandleCount": 4, "GetStdHandle": 4, "GetFileType": 4,
-    "SetLastError": 4, "CloseHandle": 4, "ExitProcess": 4, "RtlUnwind": 16,
-    "HeapAlloc": 12, "HeapFree": 12, "HeapReAlloc": 16, "HeapSize": 12,
-    "HeapCreate": 12, "HeapDestroy": 4, "VirtualAlloc": 16, "VirtualFree": 12,
-    "VirtualProtect": 16, "VirtualQuery": 12, "GetSystemInfo": 4,
-    "InitializeCriticalSection": 4, "DeleteCriticalSection": 4,
-    "EnterCriticalSection": 4, "LeaveCriticalSection": 4,
-    "CreateMutexA": 12, "ReleaseMutex": 4, "WaitForSingleObject": 8,
-    "CreateSemaphoreA": 16, "ReleaseSemaphore": 12,
-    "TlsAlloc": 0, "TlsFree": 4, "TlsGetValue": 4, "TlsSetValue": 8,
-    "InterlockedExchange": 8, "Sleep": 4,
-    "GetModuleHandleA": 4, "GetModuleFileNameA": 12, "GetProcAddress": 8,
-    "LoadLibraryA": 4, "GetVersionExA": 4, "GetStartupInfoA": 4,
-    "GetSystemTimeAsFileTime": 4, "GetTimeZoneInformation": 4,
-    "FileTimeToLocalFileTime": 8, "FileTimeToSystemTime": 8,
-    "QueryPerformanceCounter": 4,
-    "CreateFileA": 28, "ReadFile": 20, "WriteFile": 20, "SetFilePointer": 16,
-    "SetEndOfFile": 4, "FlushFileBuffers": 4, "DeleteFileA": 4,
-    "CreateDirectoryA": 8, "RemoveDirectoryA": 4,
-    "FindFirstFileA": 8, "FindNextFileA": 8,
-    "GetLocaleInfoA": 16, "GetStringTypeA": 20, "GetStringTypeW": 16,
-    "LCMapStringA": 24, "LCMapStringW": 24, "CompareStringA": 24,
-    "CompareStringW": 24, "MultiByteToWideChar": 24, "WideCharToMultiByte": 32,
-    "GetCPInfo": 8, "SetEnvironmentVariableA": 8,
-    "FreeEnvironmentStringsA": 4, "FreeEnvironmentStringsW": 4,
-    "IsBadReadPtr": 8, "IsBadWritePtr": 8, "IsBadCodePtr": 4,
-    "RaiseException": 16, "UnhandledExceptionFilter": 4,
-    "SetUnhandledExceptionFilter": 4, "TerminateProcess": 8,
-    "SetStdHandle": 8,
-}
+
+def st_index(reg):
+    return reg - R.ST0
+
+
+def is_xmm(reg):
+    return R.XMM0 <= reg <= R.XMM7
 
 
 def cname(va):
@@ -79,12 +50,11 @@ def impname(name):
 
 
 class CodeGen:
-    def __init__(self, img, an):
+    def __init__(self, img, an, log=print):
         self.img = img
         self.an = an
         self.funcs = an.funcs
-        self.cur = None  # current function being emitted
-        self.tmp_lines = []
+        self.live = FL.FlagAnalysis(an).run(log)  # entry -> {va: live-out flags}
 
     # ---- memory operand hooks used by emitops.Operands ------------------
     def mem_read(self, ins, n):
@@ -98,9 +68,7 @@ class CodeGen:
     # ---------------------------------------------------------------------
     def emit_func(self, entry):
         f = self.funcs[entry]
-        self.cur = f
-        f.insns_set = set(f.insns)
-        live = FL.liveness(f, self.an.cache)
+        live = self.live[entry]
         lines = [f"void {cname(entry)}(CPU *c) {{"]
         insns = f.insns
         # The body is emitted in address order, but the function's entry may not
@@ -108,8 +76,7 @@ class CodeGen:
         # shared tail).  Jump to the real entry on C function entry.
         if insns and insns[0] != entry:
             lines.append(f"  goto L{entry:08x};")
-        pos_of = {va: i for i, va in enumerate(insns)}
-        for i, va in enumerate(insns):
+        for va in insns:
             insn = self.an.cache[va]
             if va in f.labels or va == entry:
                 lines.append(f" L{va:08x}:;")
@@ -286,7 +253,7 @@ class CodeGen:
         return [f"{{ u32 tv = {v}; c->esp -= 4; Wr32(c->esp, tv); }}"]
 
     def i_pop(self, insn, op, live):
-        # pop into operand; esp adjust after reading (operand EA uses pre-pop esp)
+        # An esp-based destination address is computed after the increment.
         return [f"{{ u32 tv = Rd32(c->esp); c->esp += 4; {op.wr(0, 'tv')} }}"]
 
     def i_add(self, insn, op, live):
@@ -296,7 +263,6 @@ class CodeGen:
         return self._alu(op, "{a} - {b}", "SUB", live)
 
     def i_adc(self, insn, op, live):
-        ins = op.ins
         sz = op.size(0)
         lines = [f"{{ u32 ta = {op.rd(0)}, tb = {op.rd(1)}, tc = c->cf, tr;"]
         lines.append("  tr = ta + tb + tc;")
@@ -307,7 +273,6 @@ class CodeGen:
         return lines
 
     def i_sbb(self, insn, op, live):
-        ins = op.ins
         sz = op.size(0)
         lines = [f"{{ u32 ta = {op.rd(0)}, tb = {op.rd(1)}, tc = c->cf, tr;"]
         lines.append("  tr = ta - tb - tc;")
@@ -364,28 +329,29 @@ class CodeGen:
 
     # ---- shifts ----------------------------------------------------------
     def _shift(self, op, kind, live):
+        """SHL/SHR/SAR.  The count is masked to 5 bits; a zero count changes
+        neither the operand nor any flag."""
         ins = op.ins
         sz = op.size(0)
-        mask = FL.MASK[sz] if sz < 4 else "0xffffffffu"
-        # count operand (imm or CL), masked to 5 bits
-        if ins.op_count >= 2 and ins.op_kind(1) != OK.REGISTER:
-            cnt = f"({op.rd(1)} & 31)"
-        elif ins.op_count >= 2:
-            cnt = f"({op.rd(1)} & 31)"
-        else:
-            cnt = "1"
-        a = op.rd(0)
-        lines = [f"{{ u32 ta = {a} & {mask}, tcnt = {cnt}, tr;"]
+        imm = FL.shift_count(ins)
+        if imm == 0:
+            return []
+        cnt = f"{imm}u" if imm is not None else f"({op.rd(1)} & 31)"
+        sext = {1: "(i32)(i8)ta", 2: "(i32)(i16)ta", 4: "(i32)ta"}[sz]
+        lines = [f"{{ u32 ta = {op.rd(0)} & {FL.MASK[sz]}, tn = {cnt}, tr;"]
+        body = []
         if kind == "SHL":
-            lines.append("  tr = ta << tcnt;")
+            body.append("tr = ta << tn;")
         elif kind == "SHR":
-            lines.append("  tr = ta >> tcnt;")
-        elif kind == "SAR":
-            sh = sz * 8
-            lines.append(f"  tr = (u32)(((i32)(ta << {32 - sz*8})) >> (tcnt + {32 - sz*8}));")
-        lines.append("  if (tcnt) { " + op.wr(0, "tr") + " }")
-        for s in FL.emit(kind, sz, "ta", "0u", "tr", live, count="tcnt"):
-            lines.append("  " + s)
+            body.append("tr = ta >> tn;")
+        else:  # SAR on the sign-extended value; tn <= 31 keeps C shifts defined
+            body.append(f"tr = (u32)({sext} >> tn);")
+        body.append(op.wr(0, "tr"))
+        body += FL.emit(kind, sz, "ta", "0u", "tr", live, count="tn", sa=f"({sext})")
+        if imm is None:
+            lines.append("  if (tn) { " + " ".join(body) + " }")
+        else:
+            lines += ["  " + s for s in body]
         lines.append("}")
         return lines
 
@@ -402,53 +368,57 @@ class CodeGen:
         return self._shift(op, "SAR", live)
 
     def i_rcr(self, insn, op, live):
-        # only RCR_RM32_1 reachable: rotate-through-carry right by 1 (32-bit)
-        sz = op.size(0)
-        a = op.rd(0)
-        lines = [f"{{ u32 ta = {a}, tc = c->cf, tr;"]
-        lines.append(f"  tr = (ta >> 1) | (tc << {sz*8 - 1});")
+        # Only the 32-bit rotate-through-carry by one is used by the binary.
+        if op.size(0) != 4 or FL.shift_count(insn.ins) != 1:
+            return self.unhandled(insn)
+        lines = [f"{{ u32 ta = {op.rd(0)}, tr = (ta >> 1) | ((u32)c->cf << 31);"]
         lines.append("  " + op.wr(0, "tr"))
         if "cf" in live:
             lines.append("  c->cf = ta & 1;")
         if "of" in live:
-            lines.append(f"  c->of = ((tr >> {sz*8-1}) & 1) ^ ((tr >> {sz*8-2}) & 1);")
+            lines.append("  c->of = ((tr >> 31) ^ (tr >> 30)) & 1;")
         lines.append("}")
         return lines
 
-    def _shiftd(self, op, kind, live):
-        # SHLD/SHRD rm, r, count
+    def _shiftd(self, insn, op, kind, live):
+        """SHLD/SHRD r/m32, r32, imm8/CL (only 32-bit forms are used)."""
         ins = op.ins
-        sz = op.size(0)
-        dst = op.rd(0)
-        src = op.rd(1)
-        if ins.op_kind(2) == OK.REGISTER:
-            cnt = f"({op.rd(2)} & 31)"
-        else:
-            cnt = f"({op.rd(2)} & 31)"
-        lines = [f"{{ u32 td = {dst}, ts = {src}, tn = {cnt}, tr;"]
+        if op.size(0) != 4:
+            return self.unhandled(insn)
+        imm = FL.shift_count(ins)
+        if imm == 0:
+            return []
+        cnt = f"{imm}u" if imm is not None else f"({op.rd(2)} & 31)"
+        lines = [f"{{ u32 td = {op.rd(0)}, ts = {op.rd(1)}, tn = {cnt}, tr;"]
         if kind == "SHLD":
-            lines.append("  tr = tn ? ((td << tn) | (ts >> (32 - tn))) : td;")
+            body = ["tr = (td << tn) | (ts >> (32 - tn));"]
             if "cf" in live:
-                lines.append("  if (tn) c->cf = (td >> (32 - tn)) & 1;")
+                body.append("c->cf = (td >> (32 - tn)) & 1;")
         else:
-            lines.append("  tr = tn ? ((td >> tn) | (ts << (32 - tn))) : td;")
+            body = ["tr = (td >> tn) | (ts << (32 - tn));"]
             if "cf" in live:
-                lines.append("  if (tn) c->cf = (td >> (tn - 1)) & 1;")
-        lines.append("  if (tn) { " + op.wr(0, "tr") + " }")
+                body.append("c->cf = (td >> (tn - 1)) & 1;")
+        body.append(op.wr(0, "tr"))
+        if "of" in live:  # sign change on a 1-bit shift
+            body.append("if (tn == 1) c->of = ((tr ^ td) >> 31) & 1;")
         if "zf" in live:
-            lines.append("  if (tn) c->zf = (tr == 0);")
+            body.append("c->zf = (tr == 0);")
         if "sf" in live:
-            lines.append("  if (tn) c->sf = (tr >> 31) & 1;")
+            body.append("c->sf = tr >> 31;")
         if "pf" in live:
-            lines.append("  if (tn) c->pf = rg_parity(tr);")
+            body.append("c->pf = rg_parity(tr);")
+        if imm is None:
+            lines.append("  if (tn) { " + " ".join(body) + " }")
+        else:
+            lines += ["  " + s for s in body]
         lines.append("}")
         return lines
 
     def i_shld(self, insn, op, live):
-        return self._shiftd(op, "SHLD", live)
+        return self._shiftd(insn, op, "SHLD", live)
 
     def i_shrd(self, insn, op, live):
-        return self._shiftd(op, "SHRD", live)
+        return self._shiftd(insn, op, "SHRD", live)
 
     # ---- mul / div -------------------------------------------------------
     def i_mul(self, insn, op, live):
@@ -497,15 +467,16 @@ class CodeGen:
                     lines.append("  c->cf = c->of = ((i32)(i8)p != p);")
             lines.append("}")
             return lines
-        # two or three operand forms (truncated 32-bit result)
+        # two or three operand forms (result truncated to the operand size)
         if n == 2:
             a, b = op.rd(0), op.rd(1)
         else:
             a, b = op.rd(1), op.rd(2)
-        lines = [f"{{ i64 p = (i64)(i32)({a}) * (i64)(i32)({b}); u32 tr = (u32)p;",
+        sx = {2: "(i64)(i16)", 4: "(i64)(i32)"}[sz]
+        lines = [f"{{ i64 p = {sx}({a}) * {sx}({b}); u32 tr = (u32)p;",
                  "  " + op.wr(0, "tr")]
         if "cf" in live or "of" in live:
-            lines.append("  c->cf = c->of = ((i64)(i32)tr != p);")
+            lines.append(f"  c->cf = c->of = ({sx}tr != p);")
         lines.append("}")
         return lines
 
@@ -571,15 +542,11 @@ class CodeGen:
         return lines
 
     # ---- setcc -----------------------------------------------------------
-    def i_set(self, insn, op, live):
-        raise RuntimeError("unreachable")
-
     def _setcc(self, op, cc):
         return [op.wr(0, f"({self.cc_expr(cc)} ? 1u : 0u)")]
 
     # ---- xchg ------------------------------------------------------------
     def i_xchg(self, insn, op, live):
-        ins = op.ins
         return [f"{{ u32 t0 = {op.rd(0)}, t1 = {op.rd(1)};",
                 "  " + op.wr(0, "t1"),
                 "  " + op.wr(1, "t0") + " }"]
@@ -597,7 +564,8 @@ class CodeGen:
         return []
 
     def i_fnclex(self, insn, op, live):
-        return ["c->fpu_sw = 0;"]
+        # Clears the exception flags and busy bit; condition codes survive.
+        return ["c->fpu_sw &= ~0x80ffu;"]
 
     # ---- flags direct ----------------------------------------------------
     def i_clc(self, insn, op, live):
@@ -731,12 +699,9 @@ class CodeGen:
         return lines
 
     # ---- x87 -------------------------------------------------------------
-    def _fmem(self, ins):
-        """(ea, is_mem, bytes) for x87 memory operand or None if ST operand."""
-        if ins.op0_kind == OK.MEMORY:
-            return EO.mem_ea(ins), EO.mem_bytes(ins)
-        return None, None
-
+    # iced lists the implicit ST(0) of two-register forms such as
+    # `fxch st(0),st(i)` and `fcom st(0),st(i)` as operand 0; the register the
+    # instruction names is the last operand.
     def i_fld(self, insn, op, live):
         ins = insn.ins
         if ins.op0_kind == OK.MEMORY:
@@ -749,7 +714,7 @@ class CodeGen:
             if n == 10:
                 return [f"rg_fpush(c, rg_rdf80({ea}));"]
         # fld st(i)
-        i = ins.op0_register.__int__() - R.ST0.__int__()
+        i = st_index(ins.op0_register)
         return [f"{{ double v = rg_st(c, {i}); rg_fpush(c, v); }}"]
 
     def i_fild(self, insn, op, live):
@@ -775,7 +740,7 @@ class CodeGen:
             else:
                 s = [f"rg_wrf80({ea}, {st0});"]
         else:
-            i = ins.op0_register.__int__() - R.ST0.__int__()
+            i = st_index(ins.op0_register)
             s = [f"rg_setst(c, {i}, rg_st(c, 0));"]
         if pop:
             s.append("rg_fpop(c);")
@@ -810,9 +775,6 @@ class CodeGen:
     def _farith(self, insn, oper, rev=False, pop=False, toint=False):
         ins = insn.ins
         # forms: Fop m32/m64 ; Fop st,st(i) ; Fop st(i),st ; FopP st(i),st
-        if ins.op_count == 0:
-            # e.g. fsqrt handled elsewhere
-            raise RuntimeError
         if ins.op0_kind == OK.MEMORY:
             ea = EO.mem_ea(ins)
             n = EO.mem_bytes(ins)
@@ -823,9 +785,9 @@ class CodeGen:
             a, b = "rg_st(c,0)", src
             lhs = 0
         else:
-            r0 = ins.op0_register.__int__() - R.ST0.__int__()
-            r1 = ins.op1_register.__int__() - R.ST0.__int__() if ins.op_count > 1 else 0
-            if ins.op0_register == R.ST0:
+            # `fop st(0),st(i)` writes ST(0); `fop[p] st(i),st(0)` writes ST(i).
+            r0, r1 = st_index(ins.op0_register), st_index(ins.op1_register)
+            if r0 == 0:
                 a, b = "rg_st(c,0)", f"rg_st(c,{r1})"
                 lhs = 0
             else:
@@ -896,10 +858,10 @@ class CodeGen:
         return ["rg_setst(c, 0, rg_sqrt(rg_st(c,0)));"]
 
     def i_fsin(self, insn, op, live):
-        return ["rg_setst(c, 0, rg_sin(rg_st(c,0)));"]
+        return ["rg_fsin(c);"]
 
     def i_fcos(self, insn, op, live):
-        return ["rg_setst(c, 0, rg_cos(rg_st(c,0)));"]
+        return ["rg_fcos(c);"]
 
     def i_frndint(self, insn, op, live):
         return ["rg_setst(c, 0, rg_rint(c, rg_st(c,0)));"]
@@ -927,9 +889,7 @@ class CodeGen:
 
     def i_fxch(self, insn, op, live):
         ins = insn.ins
-        i = 1
-        if ins.op_count >= 1 and ins.op0_kind == OK.REGISTER:
-            i = ins.op0_register.__int__() - R.ST0.__int__()
+        i = st_index(ins.op_register(ins.op_count - 1)) if ins.op_count else 1
         return [f"rg_fxch(c, {i});"]
 
     def i_fcom(self, insn, op, live):
@@ -956,10 +916,9 @@ class CodeGen:
             ea = EO.mem_ea(ins)
             n = EO.mem_bytes(ins)
             other = f"(double)rg_rdf32({ea})" if n == 4 else f"rg_rdf64({ea})"
-        elif ins.op_count >= 1 and ins.op0_kind == OK.REGISTER:
-            i = ins.op0_register.__int__() - R.ST0.__int__()
-            other = f"rg_st(c, {i})"
-        else:
+        elif ins.op_count >= 1:  # fcom st(0),st(i)
+            other = f"rg_st(c, {st_index(ins.op_register(ins.op_count - 1))})"
+        else:                    # fcompp / fucompp
             other = "rg_st(c, 1)"
         s = [f"rg_fcom(c, rg_st(c,0), {other});"]
         for _ in range(pops):
@@ -992,7 +951,10 @@ class CodeGen:
 
     # ---- SSE2 (only the forms used by the CRT double rounder) -----------
     def _xreg(self, ins, i):
-        return ins.op_register(i).__int__() - R.XMM0.__int__()
+        r = ins.op_register(i)
+        if not is_xmm(r):
+            raise ValueError(f"operand {i} is not an xmm register")
+        return r - R.XMM0
 
     def i_movq(self, insn, op, live):
         ins = insn.ins
@@ -1037,6 +999,8 @@ class CodeGen:
         d = self._xreg(ins, 0)
         if ins.op1_kind == OK.IMMEDIATE8:
             sh = ins.immediate(1) & 0xFF
+            if sh > 63:
+                return [f"c->xmm[{d}].q[0] = 0; c->xmm[{d}].q[1] = 0;"]
             return [f"c->xmm[{d}].q[0] >>= {sh}; c->xmm[{d}].q[1] >>= {sh};"]
         sh = self._xmm_src_q(ins, 1, 0)
         return [f"{{ u64 sh = {sh}; if (sh > 63) {{ c->xmm[{d}].q[0]=0; c->xmm[{d}].q[1]=0; }} else {{ c->xmm[{d}].q[0] >>= sh; c->xmm[{d}].q[1] >>= sh; }} }}"]
@@ -1046,6 +1010,8 @@ class CodeGen:
         d = self._xreg(ins, 0)
         if ins.op1_kind == OK.IMMEDIATE8:
             sh = ins.immediate(1) & 0xFF
+            if sh > 63:
+                return [f"c->xmm[{d}].q[0] = 0; c->xmm[{d}].q[1] = 0;"]
             return [f"c->xmm[{d}].q[0] <<= {sh}; c->xmm[{d}].q[1] <<= {sh};"]
         sh = self._xmm_src_q(ins, 1, 0)
         return [f"{{ u64 sh = {sh}; if (sh > 63) {{ c->xmm[{d}].q[0]=0; c->xmm[{d}].q[1]=0; }} else {{ c->xmm[{d}].q[0] <<= sh; c->xmm[{d}].q[1] <<= sh; }} }}"]
@@ -1112,12 +1078,12 @@ class CodeGen:
 
     def i_movd(self, insn, op, live):
         ins = insn.ins
-        if ins.op0_kind == OK.REGISTER and str(ins.op0_register).find("XMM") == -1:
+        if not (ins.op0_kind == OK.REGISTER and is_xmm(ins.op0_register)):
             # movd r/m32, xmm
             return [op.wr(0, f"c->xmm[{self._xreg(ins,1)}].d[0]")]
-        # movd xmm, r/m32
+        # movd xmm, r/m32 (zero-extends into the whole register)
         d = self._xreg(ins, 0)
-        return [f"c->xmm[{d}].d[0] = {op.rd(1)}; c->xmm[{d}].d[1]=0; c->xmm[{d}].q[1]=0;"]
+        return [f"c->xmm[{d}].d[0] = {op.rd(1)}; c->xmm[{d}].d[1] = 0; c->xmm[{d}].q[1] = 0;"]
 
     def i_stmxcsr(self, insn, op, live):
         return [f"Wr32({EO.mem_ea(insn.ins)}, 0x1f80u);"]

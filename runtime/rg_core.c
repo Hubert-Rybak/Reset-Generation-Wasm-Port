@@ -2,6 +2,7 @@
 #include "rg_defs.h"
 #include "rg_mem.h"
 #include "rg_host.h"
+#include "rg_math.h"
 
 /* ---- indirect dispatch ------------------------------------------------ */
 void rg_jni_call(CPU *c, u32 index);   /* in rg_jni.c */
@@ -32,26 +33,26 @@ void rg_dispatch(CPU *c, u32 addr) {
 
 /* ---- traps ------------------------------------------------------------ */
 static char g_msg[256];
-static void fmthex(char *p, u32 v) {
-  for (int i = 7; i >= 0; i--) { int d = (v >> (i*4)) & 0xf; *p++ = d < 10 ? '0'+d : 'a'+d-10; }
+static char *put(char *p, const char *s) {
+  while (*s && p < g_msg + sizeof g_msg - 1) *p++ = *s++;
+  return p;
 }
-void rg_trap(CPU *c, u32 va, const char *what) {
-  (void)c; const char *q = "RG trap @"; char *p = g_msg;
-  while (*q) *p++ = *q++; fmthex(p, va); p += 8; *p++ = ' ';
-  while (*what) *p++ = *what++; *p = 0;
+static char *puthex(char *p, u32 v) {
+  for (int i = 7; i >= 0 && p < g_msg + sizeof g_msg - 1; i--) {
+    int d = (v >> (i * 4)) & 0xf;
+    *p++ = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+  }
+  return p;
+}
+__attribute__((noreturn)) static void panic3(const char *a, u32 va, const char *b) {
+  char *p = puthex(put(g_msg, a), va);
+  if (b) p = put(put(p, " "), b);
+  *p = 0;
   rg_host_panic(g_msg);
 }
-void rg_unhandled(CPU *c, u32 va, const char *text) {
-  (void)c; const char *q = "RG unhandled @"; char *p = g_msg;
-  while (*q) *p++ = *q++; fmthex(p, va); p += 8; *p++ = ' ';
-  while (*text && p < g_msg+250) *p++ = *text++; *p = 0;
-  rg_host_panic(g_msg);
-}
-void rg_bad_target(CPU *c, u32 addr) {
-  (void)c; const char *q = "RG bad indirect target "; char *p = g_msg;
-  while (*q) *p++ = *q++; fmthex(p, addr); p += 8; *p = 0;
-  rg_host_panic(g_msg);
-}
+void rg_trap(CPU *c, u32 va, const char *what) { (void)c; panic3("RG trap @", va, what); }
+void rg_unhandled(CPU *c, u32 va, const char *text) { (void)c; panic3("RG unhandled @", va, text); }
+void rg_bad_target(CPU *c, u32 addr) { (void)c; panic3("RG bad indirect target ", addr, 0); }
 void rg_div0(CPU *c) { (void)c; rg_host_panic("RG divide by zero"); }
 
 /* ---- cpuid ------------------------------------------------------------ */
@@ -72,22 +73,15 @@ void rg_cpuid(CPU *c) {
 }
 
 /* ---- x87 helpers ------------------------------------------------------ */
-int rg_isnan(double v) { return v != v; }
-double rg_fabs(double v) { return v < 0 ? -v : v; }
-double rg_sqrt(double v) { return __builtin_sqrt(v); }
-double rg_sin(double v) { return rg_m_sin(v); }
-double rg_cos(double v) { return rg_m_cos(v); }
-
 void rg_fcom(CPU *c, double a, double b) {
-  u32 sw = c->fpu_sw & ~((1u<<8)|(1u<<10)|(1u<<14));  /* clear C0,C2,C3 */
-  if (a != a || b != b) sw |= (1u<<8)|(1u<<10)|(1u<<14);  /* unordered */
-  else if (a < b) sw |= (1u<<8);                           /* C0 */
-  else if (a == b) sw |= (1u<<14);                         /* C3 */
-  /* a > b leaves all clear */
+  u32 sw = c->fpu_sw & ~(FSW_C0 | FSW_C1 | FSW_C2 | FSW_C3);
+  if (a != a || b != b) sw |= FSW_C0 | FSW_C2 | FSW_C3;   /* unordered */
+  else if (a < b) sw |= FSW_C0;
+  else if (a == b) sw |= FSW_C3;
   c->fpu_sw = sw;
 }
 u32 rg_fsw(CPU *c) {
-  return (c->fpu_sw & 0x47ffu) | ((u32)(c->fpu_top & 7) << 11);
+  return (c->fpu_sw & ~(7u << 11)) | ((u32)(c->fpu_top & 7) << 11);
 }
 void rg_ucomisd(CPU *c, double a, double b) {
   c->of = c->sf = c->af = 0;
@@ -97,59 +91,102 @@ void rg_ucomisd(CPU *c, double a, double b) {
   else                  { c->zf = 0; c->pf = 0; c->cf = 0; }
 }
 
-static double round_mode(CPU *c, double v) {
-  u32 rc = (c->fpu_cw >> 10) & 3;
-  switch (rc) {
-    case 0: {  /* nearest, ties to even */
-      double f = rg_m_floor(v), d = v - f;
-      if (d < 0.5) return f;
-      if (d > 0.5) return f + 1.0;
-      double e = f * 0.5; return (e == rg_m_floor(e)) ? f : f + 1.0;
-    }
-    case 1: return rg_m_floor(v);                       /* down */
-    case 2: { double f = rg_m_floor(v); return (f == v) ? f : f + 1.0; }  /* up */
-    default: return (double)(i64)v;                     /* truncate */
+/* Round to an integral value per the control word's rounding field. */
+static double fpu_round(CPU *c, double v) {
+  switch ((c->fpu_cw >> 10) & 3) {
+    case 0:  return __builtin_rint(v);    /* nearest, ties to even */
+    case 1:  return __builtin_floor(v);
+    case 2:  return __builtin_ceil(v);
+    default: return __builtin_trunc(v);
   }
 }
-i32 rg_f2i(CPU *c, double v) { return (i32)round_mode(c, v); }
-i64 rg_f2ll(CPU *c, double v) { return (i64)round_mode(c, v); }
-double rg_rint(CPU *c, double v) { return round_mode(c, v); }
+double rg_rint(CPU *c, double v) { return fpu_round(c, v); }
 
-void rg_fprem1(CPU *c) {
-  double a = rg_st(c, 0), b = rg_st(c, 1);
-  rg_setst(c, 0, rg_m_fmod(a, b));
-  c->fpu_sw &= ~(1u<<10);  /* C2 = 0: reduction complete */
+/* FIST with the invalid exception masked: NaN or an out-of-range value
+ * stores the "integer indefinite" (most negative) value. */
+i32 rg_f2i(CPU *c, double v) {
+  double r = fpu_round(c, v);
+  if (!(r >= -2147483648.0 && r < 2147483648.0)) return (i32)0x80000000u;
+  return (i32)r;
 }
-void rg_fprem(CPU *c) { rg_fprem1(c); }
+i64 rg_f2ll(CPU *c, double v) {
+  double r = fpu_round(c, v);
+  if (!(r >= -9223372036854775808.0 && r < 9223372036854775808.0))
+    return (i64)0x8000000000000000ull;
+  return (i64)r;
+}
 
-/* 80-bit extended <-> double. */
+/* FPREM/FPREM1 always finish in one step here (C2 = 0); the quotient bits
+ * in C0/C1/C3 are not modelled. */
+void rg_fprem(CPU *c) {
+  rg_setst(c, 0, rg_m_fmod(rg_st(c, 0), rg_st(c, 1)));
+  c->fpu_sw &= ~FSW_C2;
+}
+void rg_fprem1(CPU *c) {
+  rg_setst(c, 0, rg_m_remainder(rg_st(c, 0), rg_st(c, 1)));
+  c->fpu_sw &= ~FSW_C2;
+}
+
+/* FSIN/FCOS: like the hardware, an operand with |x| >= 2^63 is left in place
+ * with C2 set so the caller can reduce it with FPREM1. */
+static int trig_out_of_range(CPU *c, double x) {
+  c->fpu_sw &= ~FSW_C2;
+  if (__builtin_fabs(x) >= 0x1p63 && x - x == 0) { c->fpu_sw |= FSW_C2; return 1; }
+  return 0;
+}
+void rg_fsin(CPU *c) {
+  double x = rg_st(c, 0);
+  if (!trig_out_of_range(c, x)) rg_setst(c, 0, rg_m_sin(x));
+}
+void rg_fcos(CPU *c) {
+  double x = rg_st(c, 0);
+  if (!trig_out_of_range(c, x)) rg_setst(c, 0, rg_m_cos(x));
+}
+
+/* ---- 80-bit extended <-> double -------------------------------------- */
+/* m * 2^e rounded to the nearest double (ties to even), m != 0. */
+static double scaled_to_double(u64 m, int e) {
+  int lz = __builtin_clzll(m);
+  m <<= lz; e -= lz;                    /* m in [2^63, 2^64) */
+  int be = e + 63 + 1023, sh = 11;      /* biased exponent; bits to drop */
+  if (be >= 2047) return __builtin_inf();
+  if (be < 1) { sh += 1 - be; be = 0; } /* subnormal result */
+  if (sh > 64) return 0.0;              /* below half the smallest subnormal */
+  u64 q = sh == 64 ? 0 : m >> sh, rem = sh == 64 ? m : m & ((1ull << sh) - 1);
+  u64 half = 1ull << (sh - 1);
+  if (rem > half || (rem == half && (q & 1))) q++;
+  u64 bits;
+  if (be == 0) bits = q;                /* a carry into bit 52 yields the smallest normal */
+  else {
+    if (q >> 53) { q >>= 1; if (++be >= 2047) return __builtin_inf(); }
+    bits = ((u64)be << 52) | (q & 0xfffffffffffffull);
+  }
+  double v;
+  __builtin_memcpy(&v, &bits, 8);
+  return v;
+}
 double rg_rdf80(u32 a) {
-  u64 mant = Rd64(a);
+  u64 m = Rd64(a);
   u32 se = Rd16(a + 8);
-  int sign = (se >> 15) & 1;
-  int exp = se & 0x7fff;
-  if (exp == 0 && mant == 0) return sign ? -0.0 : 0.0;
-  double m = (double)mant * (1.0 / 18446744073709551616.0);  /* mant / 2^64 */
-  /* value = m * 2^(exp-16382) ; integer bit already in mant (bit 63) */
-  double val = m;
-  int e = exp - 16382;
-  while (e > 0) { val *= 2.0; e--; }
-  while (e < 0) { val *= 0.5; e++; }
-  return sign ? -val : val;
+  int e = (int)(se & 0x7fff);
+  double v;
+  if (e == 0x7fff) v = (m << 1) ? __builtin_nan("") : __builtin_inf();
+  else if (m == 0) v = 0.0;
+  else v = scaled_to_double(m, (e ? e : 1) - 16383 - 63);
+  return (se & 0x8000) ? -v : v;
 }
 void rg_wrf80(u32 a, double v) {
-  int sign = 0;
-  if (v < 0 || (v == 0 && 1.0/v < 0)) { sign = 1; v = -v; }
-  u64 mant = 0; u32 se = 0;
-  if (v != 0.0 && v == v) {
-    int e = 16383;
-    while (v >= 2.0) { v *= 0.5; e++; }
-    while (v < 1.0)  { v *= 2.0; e--; }
-    mant = (u64)(v * 9223372036854775808.0) << 1;  /* v*2^63, shift to bit63 */
-    mant |= 0x8000000000000000ull;
-    se = (u32)(e & 0x7fff);
-  } else if (v != v) { mant = 0xc000000000000000ull; se = 0x7fff; }
-  se |= (u32)sign << 15;
-  Wr64(a, mant);
-  Wr16(a + 8, (u16)se);
+  u64 b;
+  __builtin_memcpy(&b, &v, 8);
+  u32 sign = (u32)(b >> 63) << 15, e = (u32)(b >> 52) & 0x7ff, ex;
+  u64 f = b & 0xfffffffffffffull, m;
+  if (e == 0x7ff) { ex = 0x7fff; m = 0x8000000000000000ull | (f << 11); }   /* inf / nan */
+  else if (e == 0 && f == 0) { ex = 0; m = 0; }
+  else if (e == 0) {                       /* subnormal double: normalise */
+    int lz = __builtin_clzll(f);
+    m = f << lz;
+    ex = (u32)(16383 + 63 - 1074 - lz);
+  } else { ex = e - 1023 + 16383; m = 0x8000000000000000ull | (f << 11); }
+  Wr64(a, m);
+  Wr16(a + 8, sign | ex);
 }
